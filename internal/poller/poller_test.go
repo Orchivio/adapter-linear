@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -25,6 +26,7 @@ type fake struct {
 	comments string // JSON array
 	issues   string // JSON array
 	sinces   []string
+	hasNext  bool
 }
 
 func (f *fake) client(t *testing.T) *linear.Client {
@@ -40,8 +42,21 @@ func (f *fake) client(t *testing.T) *linear.Client {
 		case strings.Contains(req.Query, "viewer"):
 			w.Write([]byte(`{"data":` + viewerJSON + `}`))
 		case strings.Contains(req.Query, "comments("):
+			since, _ := time.Parse(time.RFC3339Nano, req.Variables["since"].(string))
 			f.sinces = append(f.sinces, req.Variables["since"].(string))
-			w.Write([]byte(`{"data":{"comments":{"nodes":` + f.comments + `,"pageInfo":{"hasNextPage":false}}}}`))
+			var all, kept []json.RawMessage
+			var served string
+			json.Unmarshal([]byte(f.comments), &all)
+			for _, raw := range all {
+				var c struct{ CreatedAt time.Time }
+				json.Unmarshal(raw, &c)
+				if c.CreatedAt.After(since) {
+					kept = append(kept, raw)
+				}
+			}
+			filtered, _ := json.Marshal(kept)
+			served = string(filtered)
+			w.Write([]byte(`{"data":{"comments":{"nodes":` + served + `,"pageInfo":{"hasNextPage":` + strconv.FormatBool(f.hasNext) + `,"endCursor":"e"}}}}`))
 		case strings.Contains(req.Query, "issues("):
 			w.Write([]byte(`{"data":{"issues":{"nodes":` + f.issues + `,"pageInfo":{"hasNextPage":false}}}}`))
 		default:
@@ -105,6 +120,7 @@ func TestMentionsBoundaries(t *testing.T) {
 		"@orchiviox then @orchivio": true,
 		"@Orchivio Bot please":      true,
 		"see https://linear.app/x/profiles/orchivio": true,
+		"https://linear.app/x/profiles/orchiviox":    false,
 	}
 	for body, want := range cases {
 		if got := mentions(body, v); got != want {
@@ -163,4 +179,53 @@ func TestRunNudgeTriggersImmediatePoll(t *testing.T) {
 	<-got // first poll
 	nudge <- struct{}{}
 	<-got // second poll only possible via nudge (interval = 1h)
+}
+
+func TestRunSendFailureRedeliversOnNextStream(t *testing.T) {
+	f := &fake{issues: `[]`, comments: `[` + comment("c1", "a", "u1", t0.Add(time.Minute)) + `,` + comment("c2", "b", "u1", t0.Add(2*time.Minute)) + `]`}
+	p := New(f.client(t), []string{"ORC"}, t0, time.Hour)
+	sent := 0
+	err := p.Run(context.Background(), nil, func(*pluginv1.TrackerEvent) error {
+		sent++
+		if sent == 2 {
+			return context.Canceled
+		}
+		return nil
+	})
+	if err == nil {
+		t.Fatal("expected send error")
+	}
+	var ids []string
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	p.Run(ctx, nil, func(ev *pluginv1.TrackerEvent) error {
+		ids = append(ids, ev.ExternalId)
+		if len(ids) == 2 {
+			cancel()
+		}
+		return nil
+	})
+	if strings.Join(ids, ",") != "comment:c1,comment:c2" {
+		t.Fatalf("ids=%v", ids)
+	}
+}
+
+func TestPollDoesNotAdvanceCursorWhenPageCapHit(t *testing.T) {
+	f := &fake{issues: `[]`, hasNext: true, comments: `[` + comment("c1", "a", "u1", t0.Add(time.Minute)) + `]`}
+	p := New(f.client(t), []string{"ORC"}, t0, time.Hour)
+	p.Poll(context.Background())
+	f.sinces = nil
+	p.Poll(context.Background())
+	if want := t0.Add(-overlap).Format(time.RFC3339Nano); f.sinces[0] != want {
+		t.Fatalf("since = %s, want unchanged %s", f.sinces[0], want)
+	}
+}
+
+func TestPollIgnoresStaleAssignmentHistory(t *testing.T) {
+	f := &fake{comments: `[]`, issues: `[{"id":"i1","identifier":"ORC-1","updatedAt":"` + t0.Add(time.Minute).Format(time.RFC3339) + `","team":{"key":"ORC"},"history":{"nodes":[
+	 {"createdAt":"` + t0.Add(-time.Hour).Format(time.RFC3339) + `","actor":{"id":"pm","email":"pm@x","name":"PM"},"toAssignee":{"id":"bot"}}]}}]`}
+	evs, _ := New(f.client(t), []string{"ORC"}, t0, time.Hour).Poll(context.Background())
+	if len(evs) != 0 {
+		t.Fatalf("evs=%v", evs)
+	}
 }

@@ -18,6 +18,94 @@ import (
 	"github.com/soemii/orchivio-adapter-linear/internal/linear"
 )
 
+func TestLateStreamSeesEventSinceProcessStart(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	lin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string
+			Variables struct{ Since string }
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "viewer"):
+			w.Write([]byte(`{"data":{"viewer":{"id":"bot","displayName":"orchivio"}}}`))
+		case strings.Contains(req.Query, "issues("):
+			w.Write([]byte(`{"data":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}`))
+		default:
+			nodes := `[]`
+			if since, _ := time.Parse(time.RFC3339Nano, req.Variables.Since); since.Before(time.Date(2026, 1, 1, 12, 1, 0, 0, time.UTC)) {
+				nodes = `[{"id":"c1","body":"hi","createdAt":"2026-01-01T12:01:00Z","user":{"id":"u1"},"issue":{"identifier":"ORC-1","team":{"key":"ORC"}}}]`
+			}
+			w.Write([]byte(`{"data":{"comments":{"nodes":` + nodes + `,"pageInfo":{"hasNextPage":false}}}}`))
+		}
+	}))
+	defer lin.Close()
+	late := false
+	now := func() time.Time {
+		if late {
+			return t0.Add(time.Hour)
+		}
+		return t0
+	}
+	srv := New(linear.New(lin.URL, "k"), NewHub(), []string{"ORC"}, time.Hour, false, now)
+	late = true // any now() call after construction is much later
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stream := &recvStream{ctx: ctx, got: make(chan *pluginv1.TrackerEvent, 1)}
+	go srv.StreamEvents(&pluginv1.StreamEventsRequest{}, stream)
+	select {
+	case ev := <-stream.got:
+		if ev.ExternalId != "comment:c1" {
+			t.Fatalf("ev=%v", ev)
+		}
+	case <-ctx.Done():
+		t.Fatal("late stream missed event created after process start")
+	}
+}
+
+func TestCloseEndsOpenStreams(t *testing.T) {
+	lin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct{ Query string }
+		json.NewDecoder(r.Body).Decode(&req)
+		if strings.Contains(req.Query, "viewer") {
+			w.Write([]byte(`{"data":{"viewer":{"id":"bot"}}}`))
+			return
+		}
+		w.Write([]byte(`{"data":{"issues":{"nodes":[],"pageInfo":{}},"comments":{"nodes":[],"pageInfo":{}}}}`))
+	}))
+	defer lin.Close()
+	srv := New(linear.New(lin.URL, "k"), NewHub(), []string{"ORC"}, time.Hour, false, time.Now)
+	done := make(chan error, 1)
+	go func() {
+		done <- srv.StreamEvents(&pluginv1.StreamEventsRequest{}, &recvStream{ctx: context.Background(), got: make(chan *pluginv1.TrackerEvent, 1)})
+	}()
+	srv.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("stream did not end after Close")
+	}
+}
+
+type recvStream struct {
+	grpc.ServerStream
+	ctx context.Context
+	got chan *pluginv1.TrackerEvent
+}
+
+func (s *recvStream) Context() context.Context { return s.ctx }
+func (s *recvStream) Send(ev *pluginv1.TrackerEvent) error {
+	select {
+	case s.got <- ev:
+	default:
+	}
+	return nil
+}
+
 func TestStreamEventsPollsThenNudge(t *testing.T) {
 	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	polls := 0

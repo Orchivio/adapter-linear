@@ -57,11 +57,11 @@ func TestClientPaginatesUpToCap(t *testing.T) {
 		w.Write([]byte(`{"data":{"comments":{"nodes":[{"id":"c"}],"pageInfo":{"hasNextPage":true,"endCursor":"x"}}}}`))
 	}))
 	defer srv.Close()
-	cs, err := New(srv.URL, "k").CommentsSince(context.Background(), []string{"ORC"}, testTime)
+	cs, truncated, err := New(srv.URL, "k").CommentsSince(context.Background(), []string{"ORC"}, testTime)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if calls != maxPages || len(cs) != maxPages {
+	if calls != maxPages || len(cs) != maxPages || !truncated {
 		t.Fatalf("calls=%d comments=%d", calls, len(cs))
 	}
 }

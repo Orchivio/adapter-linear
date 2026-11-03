@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	pluginv1 "github.com/soemii/orchivio-server/contract/gen/orchivio/plugin/v1"
 
@@ -18,51 +20,82 @@ import (
 // missed; the server dedups on (source, external_id).
 const overlap = time.Second
 
-// Poller holds the cursors of one event stream.
-// ponytail: one poller per stream, no shared poller + fan-out; share if many subscribers appear.
+// Poller owns the process-level cursors shared by all event streams.
+// Cursors advance only after a whole batch was delivered (Run) or returned
+// (Poll), so a failed send re-delivers on the next stream; concurrent streams
+// may both deliver, the server dedups.
+// ponytail: each stream polls Linear itself; share one poll loop + fan-out if many subscribers appear.
 type Poller struct {
 	c        *linear.Client
 	teams    []string
 	interval time.Duration
 	log      *slog.Logger
 
-	assignedCursor time.Time
-	commentCursor  time.Time
+	mu       sync.Mutex
+	assigned time.Time
+	comments time.Time
 }
+
+type cursors struct{ assigned, comments time.Time }
 
 // New starts both cursors at now (no replay of old events).
 func New(c *linear.Client, teams []string, now time.Time, interval time.Duration) *Poller {
-	return &Poller{c: c, teams: teams, interval: interval, log: slog.Default(), assignedCursor: now, commentCursor: now}
+	return &Poller{c: c, teams: teams, interval: interval, log: slog.Default(), assigned: now, comments: now}
 }
 
-// Poll fetches new assignments and comments since the cursors.
+// Poll fetches new events and commits the cursors immediately.
 func (p *Poller) Poll(ctx context.Context) ([]*pluginv1.TrackerEvent, error) {
+	events, next, err := p.fetch(ctx)
+	if err != nil {
+		return nil, err
+	}
+	p.commit(next)
+	return events, nil
+}
+
+func (p *Poller) commit(n cursors) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if n.assigned.After(p.assigned) {
+		p.assigned = n.assigned
+	}
+	if n.comments.After(p.comments) {
+		p.comments = n.comments
+	}
+}
+
+// fetch returns events plus the candidate cursors without committing them.
+func (p *Poller) fetch(ctx context.Context) ([]*pluginv1.TrackerEvent, cursors, error) {
 	viewer, err := p.c.Viewer(ctx)
 	if err != nil {
-		return nil, err
+		return nil, cursors{}, err
 	}
-	var events []*pluginv1.TrackerEvent
+	p.mu.Lock()
+	next := cursors{assigned: p.assigned, comments: p.comments}
+	p.mu.Unlock()
+	assignedSince, commentsSince := next.assigned.Add(-overlap), next.comments.Add(-overlap)
 
-	assigned, err := p.c.AssignedSince(ctx, p.teams, p.assignedCursor.Add(-overlap))
+	assigned, assignedTruncated, err := p.c.AssignedSince(ctx, p.teams, assignedSince)
 	if err != nil {
-		return nil, err
+		return nil, cursors{}, err
 	}
-	comments, err := p.c.CommentsSince(ctx, p.teams, p.commentCursor.Add(-overlap))
+	comments, commentsTruncated, err := p.c.CommentsSince(ctx, p.teams, commentsSince)
 	if err != nil {
-		return nil, err // cursors untouched: nothing is lost on retry
+		return nil, cursors{}, err
 	}
+
+	var events []*pluginv1.TrackerEvent
 	for _, a := range assigned {
-		if a.UpdatedAt.After(p.assignedCursor) {
-			p.assignedCursor = a.UpdatedAt
+		if !assignedTruncated && a.UpdatedAt.After(next.assigned) {
+			next.assigned = a.UpdatedAt
 		}
-		if ev := p.assignmentEvent(a, viewer); ev != nil {
+		if ev := p.assignmentEvent(a, viewer, assignedSince); ev != nil {
 			events = append(events, ev)
 		}
 	}
-
 	for _, cm := range comments {
-		if cm.CreatedAt.After(p.commentCursor) {
-			p.commentCursor = cm.CreatedAt
+		if !commentsTruncated && cm.CreatedAt.After(next.comments) {
+			next.comments = cm.CreatedAt
 		}
 		if cm.User == nil || cm.User.ID == viewer.ID { // bot comments and our own: no loops
 			continue
@@ -77,19 +110,25 @@ func (p *Poller) Poll(ctx context.Context) ([]*pluginv1.TrackerEvent, error) {
 			MentionsBot: mentions(cm.Body, viewer),
 		})
 	}
-	return events, nil
+	if assignedTruncated || commentsTruncated {
+		// ponytail: >500 events per poll re-fetches the same window; raise cap or switch to ascending order
+		p.log.Warn("page cap reached, cursor not advanced", "assignments", assignedTruncated, "comments", commentsTruncated)
+	}
+	return events, next, nil
 }
 
-func (p *Poller) assignmentEvent(a linear.Assignment, viewer linear.Viewer) *pluginv1.TrackerEvent {
+// assignmentEvent ignores history entries not newer than since: an issue
+// updated for other reasons must not re-emit an old assignment.
+func (p *Poller) assignmentEvent(a linear.Assignment, viewer linear.Viewer, since time.Time) *pluginv1.TrackerEvent {
 	var best *linear.HistoryEntry
 	for i := range a.History.Nodes {
 		h := &a.History.Nodes[i]
-		if h.ToAssignee != nil && h.ToAssignee.ID == viewer.ID && (best == nil || h.CreatedAt.After(best.CreatedAt)) {
+		if h.ToAssignee != nil && h.ToAssignee.ID == viewer.ID && h.CreatedAt.After(since) && (best == nil || h.CreatedAt.After(best.CreatedAt)) {
 			best = h
 		}
 	}
 	if best == nil || best.Actor == nil {
-		p.log.Warn("assignment without history entry, skipping", "issue", a.Identifier)
+		p.log.Debug("no new assignment entry, skipping", "issue", a.Identifier)
 		return nil
 	}
 	return &pluginv1.TrackerEvent{
@@ -102,7 +141,7 @@ func (p *Poller) assignmentEvent(a linear.Assignment, viewer linear.Viewer) *plu
 }
 
 // mentions reports an @displayName/@name token (case-insensitive, whole token)
-// or a profile URL containing /profiles/<displayName>.
+// or a profile URL /profiles/<displayName> with the same token boundary.
 func mentions(body string, v linear.Viewer) bool {
 	lower := strings.ToLower(body)
 	for _, name := range []string{v.DisplayName, v.Name} {
@@ -110,7 +149,7 @@ func mentions(body string, v linear.Viewer) bool {
 			return true
 		}
 	}
-	return v.DisplayName != "" && strings.Contains(lower, "/profiles/"+strings.ToLower(v.DisplayName))
+	return v.DisplayName != "" && hasToken(lower, "/profiles/"+strings.ToLower(v.DisplayName))
 }
 
 func hasToken(s, tok string) bool {
@@ -123,7 +162,7 @@ func hasToken(s, tok string) bool {
 		if end == len(s) {
 			return true
 		}
-		if r := []rune(s[end:])[0]; !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' {
+		if r, _ := utf8.DecodeRuneInString(s[end:]); !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' {
 			return true
 		}
 		off += i + 1
@@ -134,7 +173,7 @@ func hasToken(s, tok string) bool {
 // logged and retried on the next tick; it returns on ctx cancel or send error.
 func (p *Poller) Run(ctx context.Context, nudge <-chan struct{}, send func(*pluginv1.TrackerEvent) error) error {
 	for {
-		events, err := p.Poll(ctx)
+		events, next, err := p.fetch(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -146,6 +185,7 @@ func (p *Poller) Run(ctx context.Context, nudge <-chan struct{}, send func(*plug
 				return err
 			}
 		}
+		p.commit(next)
 		timer := time.NewTimer(p.interval)
 		select {
 		case <-ctx.Done():

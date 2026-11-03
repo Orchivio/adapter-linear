@@ -95,7 +95,7 @@ const (
 
 	assignedQuery = `query($teams: [String!], $since: DateTimeOrDuration!, $after: String) {
   issues(first: 100, after: $after, filter: { assignee: { isMe: { eq: true } }, updatedAt: { gt: $since }, team: { key: { in: $teams } } }) {
-    nodes { id identifier updatedAt team { key } history(first: 10) { nodes { createdAt actor { id email name } toAssignee { id } } } }
+    nodes { id identifier updatedAt team { key } history(first: 50) { nodes { createdAt actor { id email name } toAssignee { id } } } }
     pageInfo { hasNextPage endCursor }
   }
 }`
@@ -177,33 +177,35 @@ type pageInfo struct {
 }
 
 // paginate runs query up to maxPages times; field is the connection name.
-func paginate[T any](ctx context.Context, c *Client, query, field string, vars map[string]any) ([]T, error) {
-	var all []T
+// truncated is true when the cap was hit while hasNextPage was still true.
+func paginate[T any](ctx context.Context, c *Client, query, field string, vars map[string]any) (all []T, truncated bool, err error) {
 	for page := 0; page < maxPages; page++ {
 		var d map[string]struct {
 			Nodes    []T      `json:"nodes"`
 			PageInfo pageInfo `json:"pageInfo"`
 		}
 		if err := c.do(ctx, query, vars, &d); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		conn := d[field]
 		all = append(all, conn.Nodes...)
 		if !conn.PageInfo.HasNextPage {
-			break
+			return all, false, nil
 		}
 		vars["after"] = conn.PageInfo.EndCursor
 	}
-	return all, nil
+	return all, true, nil
 }
 
 // AssignedSince returns issues assigned to the viewer and updated after since.
-func (c *Client) AssignedSince(ctx context.Context, teams []string, since time.Time) ([]Assignment, error) {
+// truncated reports that the page cap was reached with more results pending.
+func (c *Client) AssignedSince(ctx context.Context, teams []string, since time.Time) ([]Assignment, bool, error) {
 	return paginate[Assignment](ctx, c, assignedQuery, "issues", map[string]any{"teams": teams, "since": since.UTC().Format(time.RFC3339Nano)})
 }
 
 // CommentsSince returns comments created after since on the given teams.
-func (c *Client) CommentsSince(ctx context.Context, teams []string, since time.Time) ([]Comment, error) {
+// truncated reports that the page cap was reached with more results pending.
+func (c *Client) CommentsSince(ctx context.Context, teams []string, since time.Time) ([]Comment, bool, error) {
 	return paginate[Comment](ctx, c, commentsQuery, "comments", map[string]any{"teams": teams, "since": since.UTC().Format(time.RFC3339Nano)})
 }
 

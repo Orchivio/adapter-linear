@@ -61,6 +61,10 @@ func run() error {
 		}
 	}
 
+	if len(teams) == 0 {
+		return errors.New("LINEAR_TEAM_KEYS must list at least one team key")
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -76,7 +80,8 @@ func run() error {
 	}
 	// ponytail: insecure gRPC for the dev loop; add mTLS before leaving localhost.
 	grpcServer := grpc.NewServer()
-	pluginv1.RegisterTrackerAdapterServer(grpcServer, server.New(client, hub, teams, interval, webhookSecret != "", time.Now))
+	adapter := server.New(client, hub, teams, interval, webhookSecret != "", time.Now)
+	pluginv1.RegisterTrackerAdapterServer(grpcServer, adapter)
 	httpServer := &http.Server{Addr: env("ORCHIVIO_WEBHOOK_ADDR", ":7102"), Handler: server.WebhookHandler(webhookSecret, hub), ReadHeaderTimeout: 10 * time.Second}
 
 	errs := make(chan error, 2)
@@ -88,6 +93,7 @@ func run() error {
 	case err = <-errs:
 	case <-ctx.Done():
 	}
+	adapter.Close()
 	shutdown(grpcServer, httpServer)
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil

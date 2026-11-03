@@ -15,6 +15,9 @@ import (
 type Server struct {
 	pluginv1.UnimplementedTrackerAdapterServer
 	client   *linear.Client
+	poller   *poller.Poller // process-level cursors, created at construction
+	ctx      context.Context
+	cancel   context.CancelFunc
 	hub      *Hub
 	teams    []string
 	interval time.Duration
@@ -23,7 +26,8 @@ type Server struct {
 }
 
 func New(client *linear.Client, hub *Hub, teams []string, interval time.Duration, webhooks bool, now func() time.Time) *Server {
-	return &Server{client: client, hub: hub, teams: teams, interval: interval, webhooks: webhooks, now: now}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Server{client: client, poller: poller.New(client, teams, now(), interval), ctx: ctx, cancel: cancel, hub: hub, teams: teams, interval: interval, webhooks: webhooks, now: now}
 }
 
 func (s *Server) GetCapabilities(context.Context, *pluginv1.GetCapabilitiesRequest) (*pluginv1.Capabilities, error) {
@@ -34,8 +38,12 @@ func (s *Server) GetCapabilities(context.Context, *pluginv1.GetCapabilitiesReque
 func (s *Server) StreamEvents(_ *pluginv1.StreamEventsRequest, stream pluginv1.TrackerAdapter_StreamEventsServer) error {
 	nudge, unsubscribe := s.hub.Subscribe()
 	defer unsubscribe()
-	err := poller.New(s.client, s.teams, s.now(), s.interval).Run(stream.Context(), nudge, stream.Send)
-	if stream.Context().Err() != nil {
+	ctx, cancel := context.WithCancel(stream.Context())
+	defer cancel()
+	stop := context.AfterFunc(s.ctx, cancel) // server shutdown ends open streams
+	defer stop()
+	err := s.poller.Run(ctx, nudge, stream.Send)
+	if ctx.Err() != nil {
 		return nil
 	}
 	return err
@@ -56,3 +64,6 @@ func (s *Server) PostComment(ctx context.Context, req *pluginv1.PostCommentReque
 	}
 	return &pluginv1.PostCommentResponse{CommentId: id}, nil
 }
+
+// Close ends all open streams so GracefulStop does not wait for them.
+func (s *Server) Close() { s.cancel() }
