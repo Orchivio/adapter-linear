@@ -47,6 +47,10 @@ func (p *Poller) Poll(ctx context.Context) ([]*pluginv1.TrackerEvent, error) {
 	if err != nil {
 		return nil, err
 	}
+	comments, err := p.c.CommentsSince(ctx, p.teams, p.commentCursor.Add(-overlap))
+	if err != nil {
+		return nil, err // cursors untouched: nothing is lost on retry
+	}
 	for _, a := range assigned {
 		if a.UpdatedAt.After(p.assignedCursor) {
 			p.assignedCursor = a.UpdatedAt
@@ -56,10 +60,6 @@ func (p *Poller) Poll(ctx context.Context) ([]*pluginv1.TrackerEvent, error) {
 		}
 	}
 
-	comments, err := p.c.CommentsSince(ctx, p.teams, p.commentCursor.Add(-overlap))
-	if err != nil {
-		return nil, err
-	}
 	for _, cm := range comments {
 		if cm.CreatedAt.After(p.commentCursor) {
 			p.commentCursor = cm.CreatedAt
