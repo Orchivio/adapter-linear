@@ -74,11 +74,11 @@ func run() error {
 	}
 
 	hub := server.NewHub()
-	lis, err := net.Listen("tcp", env("ORCHIVIO_GRPC_ADDR", ":7101"))
+	lis, err := net.Listen("tcp", env("ORCHIVIO_GRPC_ADDR", "127.0.0.1:7101"))
 	if err != nil {
 		return err
 	}
-	// ponytail: insecure gRPC for the dev loop; add mTLS before leaving localhost.
+	// ponytail: insecure gRPC, bind localhost; mTLS before remote workers.
 	grpcServer := grpc.NewServer()
 	adapter := server.New(client, hub, teams, interval, webhookSecret != "", time.Now)
 	pluginv1.RegisterTrackerAdapterServer(grpcServer, adapter)
