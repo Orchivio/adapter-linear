@@ -1,9 +1,9 @@
-module github.com/soemii/orchivio-adapter-linear
+module github.com/orchivio/adapter-linear
 
 go 1.26.3
 
 require (
-	github.com/soemii/orchivio-server/contract v0.0.0
+	github.com/orchivio/orchestrator/contract v0.0.0
 	google.golang.org/grpc v1.85.0
 )
 
@@ -15,4 +15,4 @@ require (
 	google.golang.org/protobuf v1.36.12 // indirect
 )
 
-replace github.com/soemii/orchivio-server/contract => ../orchivio-server/contract
+replace github.com/orchivio/orchestrator/contract => ../orchestrator/contract

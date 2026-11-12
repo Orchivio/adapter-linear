@@ -5,10 +5,10 @@ import (
 	"context"
 	"time"
 
-	pluginv1 "github.com/soemii/orchivio-server/contract/gen/orchivio/plugin/v1"
+	pluginv1 "github.com/orchivio/orchestrator/contract/gen/orchivio/plugin/v1"
 
-	"github.com/soemii/orchivio-adapter-linear/internal/linear"
-	"github.com/soemii/orchivio-adapter-linear/internal/poller"
+	"github.com/orchivio/adapter-linear/internal/linear"
+	"github.com/orchivio/adapter-linear/internal/poller"
 )
 
 // Server is the TrackerAdapter gRPC service.

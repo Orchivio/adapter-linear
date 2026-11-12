@@ -10,12 +10,12 @@ import (
 	"testing"
 	"time"
 
-	pluginv1 "github.com/soemii/orchivio-server/contract/gen/orchivio/plugin/v1"
+	pluginv1 "github.com/orchivio/orchestrator/contract/gen/orchivio/plugin/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 
-	"github.com/soemii/orchivio-adapter-linear/internal/linear"
+	"github.com/orchivio/adapter-linear/internal/linear"
 )
 
 func TestLateStreamSeesEventSinceProcessStart(t *testing.T) {

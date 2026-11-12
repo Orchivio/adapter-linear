@@ -11,9 +11,9 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	pluginv1 "github.com/soemii/orchivio-server/contract/gen/orchivio/plugin/v1"
+	pluginv1 "github.com/orchivio/orchestrator/contract/gen/orchivio/plugin/v1"
 
-	"github.com/soemii/orchivio-adapter-linear/internal/linear"
+	"github.com/orchivio/adapter-linear/internal/linear"
 )
 
 // overlap re-reads a small window so events with equal timestamps are not

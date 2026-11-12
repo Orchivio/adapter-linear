@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	pluginv1 "github.com/soemii/orchivio-server/contract/gen/orchivio/plugin/v1"
+	pluginv1 "github.com/orchivio/orchestrator/contract/gen/orchivio/plugin/v1"
 
-	"github.com/soemii/orchivio-adapter-linear/internal/linear"
+	"github.com/orchivio/adapter-linear/internal/linear"
 )
 
 var t0 = time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
