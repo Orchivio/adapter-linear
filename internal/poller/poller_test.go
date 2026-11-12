@@ -229,3 +229,34 @@ func TestPollIgnoresStaleAssignmentHistory(t *testing.T) {
 		t.Fatalf("evs=%v", evs)
 	}
 }
+
+func TestPollDelegationToAppUserIsAssignment(t *testing.T) {
+	f := &fake{comments: `[]`, issues: `[{"id":"i1","identifier":"ORC-1","updatedAt":"` + t0.Add(time.Minute).Format(time.RFC3339) + `","team":{"key":"ORC"},"history":{"nodes":[
+	 {"createdAt":"` + t0.Add(time.Second).Format(time.RFC3339) + `","actor":{"id":"pm","email":"pm@x","name":"PM"},"toAssignee":null,"toDelegate":{"id":"bot"}}]}}]`}
+	evs, err := New(f.client(t), []string{"ORC"}, t0, time.Hour).Poll(context.Background())
+	if err != nil || len(evs) != 1 || evs[0].Kind != pluginv1.TrackerEvent_ASSIGNED || evs[0].Actor.Email != "pm@x" {
+		t.Fatalf("evs=%v err=%v", evs, err)
+	}
+}
+
+func TestPollIssueCreatedDelegatedToAppUserIsAssignment(t *testing.T) {
+	created := t0.Add(time.Second)
+	f := &fake{comments: `[]`, issues: `[{"id":"i1","identifier":"RES-9","createdAt":"` + created.Format(time.RFC3339) + `","updatedAt":"` + created.Format(time.RFC3339) + `","team":{"key":"RES"},
+	 "creator":{"id":"pm","email":"pm@x","name":"PM"},"assignee":{"id":"pm"},"delegate":{"id":"bot"},"history":{"nodes":[]}}]`}
+	evs, err := New(f.client(t), []string{"RES"}, t0, time.Hour).Poll(context.Background())
+	if err != nil || len(evs) != 1 || evs[0].Kind != pluginv1.TrackerEvent_ASSIGNED || evs[0].Actor.Email != "pm@x" {
+		t.Fatalf("evs=%v err=%v", evs, err)
+	}
+	if evs[0].ExternalId != "assign:i1:"+created.Format(time.RFC3339Nano) {
+		t.Fatalf("external id = %q", evs[0].ExternalId)
+	}
+}
+
+func TestPollIgnoresOldIssueDelegatedWithoutHistory(t *testing.T) {
+	f := &fake{comments: `[]`, issues: `[{"id":"i1","identifier":"RES-9","createdAt":"` + t0.Add(-time.Hour).Format(time.RFC3339) + `","updatedAt":"` + t0.Add(time.Minute).Format(time.RFC3339) + `","team":{"key":"RES"},
+	 "creator":{"id":"pm","email":"pm@x","name":"PM"},"delegate":{"id":"bot"},"history":{"nodes":[]}}]`}
+	evs, _ := New(f.client(t), []string{"RES"}, t0, time.Hour).Poll(context.Background())
+	if len(evs) != 0 {
+		t.Fatalf("evs=%v", evs)
+	}
+}

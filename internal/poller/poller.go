@@ -123,9 +123,14 @@ func (p *Poller) assignmentEvent(a linear.Assignment, viewer linear.Viewer, sinc
 	var best *linear.HistoryEntry
 	for i := range a.History.Nodes {
 		h := &a.History.Nodes[i]
-		if h.ToAssignee != nil && h.ToAssignee.ID == viewer.ID && h.CreatedAt.After(since) && (best == nil || h.CreatedAt.After(best.CreatedAt)) {
+		if toViewer(h, viewer) && h.CreatedAt.After(since) && (best == nil || h.CreatedAt.After(best.CreatedAt)) {
 			best = h
 		}
+	}
+	if best == nil && a.CreatedAt.After(since) && createdForViewer(a, viewer) {
+		// Linear writes no history entry when an issue is created already
+		// assigned or delegated; the creator is the assigning actor.
+		best = &linear.HistoryEntry{CreatedAt: a.CreatedAt, Actor: a.Creator}
 	}
 	if best == nil || best.Actor == nil {
 		p.log.Debug("no new assignment entry, skipping", "issue", a.Identifier)
@@ -138,6 +143,15 @@ func (p *Poller) assignmentEvent(a linear.Assignment, viewer linear.Viewer, sinc
 		ProjectKey: a.Team.Key,
 		Actor:      &pluginv1.Actor{Id: best.Actor.ID, Email: best.Actor.Email, Name: best.Actor.Name},
 	}
+}
+
+// toViewer reports an assignment or (for app users) a delegation to the viewer.
+func toViewer(h *linear.HistoryEntry, v linear.Viewer) bool {
+	return (h.ToAssignee != nil && h.ToAssignee.ID == v.ID) || (h.ToDelegate != nil && h.ToDelegate.ID == v.ID)
+}
+
+func createdForViewer(a linear.Assignment, v linear.Viewer) bool {
+	return (a.Assignee != nil && a.Assignee.ID == v.ID) || (a.Delegate != nil && a.Delegate.ID == v.ID)
 }
 
 // mentions reports an @displayName/@name token (case-insensitive, whole token)

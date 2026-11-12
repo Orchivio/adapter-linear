@@ -23,7 +23,7 @@ const (
 // Client talks to Linear. Safe for concurrent use.
 type Client struct {
 	endpoint string
-	apiKey   string
+	auth     func(ctx context.Context, renew bool) (string, error) // Authorization header value
 	http     *http.Client
 
 	mu     sync.Mutex
@@ -31,9 +31,15 @@ type Client struct {
 	ids    map[string]string // identifier -> issue UUID
 }
 
-// New creates a client. The API key is sent raw (no "Bearer").
+// New creates a client for a personal API key, sent raw (no "Bearer").
 func New(endpoint, apiKey string) *Client {
-	return &Client{endpoint: endpoint, apiKey: apiKey, http: &http.Client{Timeout: requestTimeout}, ids: map[string]string{}}
+	c := newClient(endpoint)
+	c.auth = func(context.Context, bool) (string, error) { return apiKey, nil }
+	return c
+}
+
+func newClient(endpoint string) *Client {
+	return &Client{endpoint: endpoint, http: &http.Client{Timeout: requestTimeout}, ids: map[string]string{}}
 }
 
 type Viewer struct {
@@ -55,13 +61,25 @@ type HistoryEntry struct {
 	ToAssignee *struct {
 		ID string `json:"id"`
 	} `json:"toAssignee"`
+	// ToDelegate is set when an issue is delegated to an app user.
+	ToDelegate *struct {
+		ID string `json:"id"`
+	} `json:"toDelegate"`
 }
 
 type Assignment struct {
 	IssueID    string    `json:"id"`
 	Identifier string    `json:"identifier"`
+	CreatedAt  time.Time `json:"createdAt"`
 	UpdatedAt  time.Time `json:"updatedAt"`
-	Team       struct {
+	Creator    *User     `json:"creator"`
+	Assignee   *struct {
+		ID string `json:"id"`
+	} `json:"assignee"`
+	Delegate *struct {
+		ID string `json:"id"`
+	} `json:"delegate"`
+	Team struct {
 		Key string `json:"key"`
 	} `json:"team"`
 	History struct {
@@ -94,8 +112,8 @@ const (
 	viewerQuery = `query { viewer { id name displayName email } }`
 
 	assignedQuery = `query($teams: [String!], $since: DateTimeOrDuration!, $after: String) {
-  issues(first: 100, after: $after, filter: { assignee: { isMe: { eq: true } }, updatedAt: { gt: $since }, team: { key: { in: $teams } } }) {
-    nodes { id identifier updatedAt team { key } history(first: 50) { nodes { createdAt actor { id email name } toAssignee { id } } } }
+  issues(first: 100, after: $after, filter: { or: [{ assignee: { isMe: { eq: true } } }, { delegate: { isMe: { eq: true } } }], updatedAt: { gt: $since }, team: { key: { in: $teams } } }) {
+    nodes { id identifier createdAt updatedAt creator { id email name } assignee { id } delegate { id } team { key } history(first: 50) { nodes { createdAt actor { id email name } toAssignee { id } toDelegate { id } } } }
     pageInfo { hasNextPage endCursor }
   }
 }`
@@ -117,16 +135,13 @@ func (c *Client) do(ctx context.Context, query string, vars map[string]any, out 
 	if err != nil {
 		return fmt.Errorf("linear: encode request: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(payload))
-	if err != nil {
-		return fmt.Errorf("linear: build request: %w", err)
+	resp, err := c.post(ctx, payload, false)
+	if err == nil && resp.StatusCode == http.StatusUnauthorized {
+		resp.Body.Close() // token revoked or expired early: renew once
+		resp, err = c.post(ctx, payload, true)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", c.apiKey)
-	resp, err := c.http.Do(req)
 	if err != nil {
-		// url.Error carries the URL only, never headers.
-		return fmt.Errorf("linear: request failed: %w", err)
+		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
@@ -154,7 +169,26 @@ func (c *Client) do(ctx context.Context, query string, vars map[string]any, out 
 	return nil
 }
 
-// Viewer returns the API key's user; fetched once and cached.
+func (c *Client) post(ctx context.Context, payload []byte, renew bool) (*http.Response, error) {
+	auth, err := c.auth(ctx, renew)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("linear: build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", auth)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		// url.Error carries the URL only, never headers.
+		return nil, fmt.Errorf("linear: request failed: %w", err)
+	}
+	return resp, nil
+}
+
+// Viewer returns the authenticated user (or app user); fetched once and cached.
 func (c *Client) Viewer(ctx context.Context) (Viewer, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

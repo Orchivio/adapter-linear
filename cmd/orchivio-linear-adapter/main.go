@@ -38,9 +38,26 @@ func env(name, def string) string {
 	return def
 }
 
+// newClient acts as the OAuth app user when LINEAR_CLIENT_ID is set,
+// otherwise as the owner of a personal API key.
+func newClient(resolver secretref.Env) (*linear.Client, error) {
+	if id := os.Getenv("LINEAR_CLIENT_ID"); id != "" {
+		secret, err := resolver.Resolve(os.Getenv("LINEAR_CLIENT_SECRET_REF"))
+		if err != nil {
+			return nil, err
+		}
+		return linear.NewApp(linear.DefaultEndpoint, env("LINEAR_TOKEN_URL", linear.DefaultTokenURL), id, secret), nil
+	}
+	apiKey, err := resolver.Resolve(os.Getenv("LINEAR_API_KEY_REF"))
+	if err != nil {
+		return nil, err
+	}
+	return linear.New(linear.DefaultEndpoint, apiKey), nil
+}
+
 func run() error {
 	resolver := secretref.Env{Lookup: os.LookupEnv}
-	apiKey, err := resolver.Resolve(os.Getenv("LINEAR_API_KEY_REF"))
+	client, err := newClient(resolver)
 	if err != nil {
 		return err
 	}
@@ -68,7 +85,6 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	client := linear.New(linear.DefaultEndpoint, apiKey)
 	if _, err := client.Viewer(ctx); err != nil { // fail fast on a bad key
 		return err
 	}
