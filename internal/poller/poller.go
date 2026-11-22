@@ -20,32 +20,32 @@ import (
 // missed; the server dedups on (source, external_id).
 const overlap = time.Second
 
-// Poller owns the process-level cursors shared by all event streams.
-// Cursors advance only after a whole batch was delivered (Run) or returned
-// (Poll), so a failed send re-delivers on the next stream; concurrent streams
-// may both deliver, the server dedups.
+// Poller owns the process-level cursors per team key, shared by all event
+// streams. Cursors advance only after a whole batch was delivered (Run) or
+// returned (Poll), so a failed send re-delivers on the next stream; concurrent
+// streams may both deliver, the server dedups.
 // ponytail: each stream polls Linear itself; share one poll loop + fan-out if many subscribers appear.
 type Poller struct {
 	c        *linear.Client
-	teams    []string
+	now      func() time.Time
 	interval time.Duration
 	log      *slog.Logger
 
-	mu       sync.Mutex
-	assigned time.Time
-	comments time.Time
+	mu      sync.Mutex
+	cursors map[string]cursors // by team key
 }
 
 type cursors struct{ assigned, comments time.Time }
 
-// New starts both cursors at now (no replay of old events).
-func New(c *linear.Client, teams []string, now time.Time, interval time.Duration) *Poller {
-	return &Poller{c: c, teams: teams, interval: interval, log: slog.Default(), assigned: now, comments: now}
+// New creates a poller without cursors; a team key starts at now() when it
+// is first requested (no replay of old events).
+func New(c *linear.Client, now func() time.Time, interval time.Duration) *Poller {
+	return &Poller{c: c, now: now, interval: interval, log: slog.Default(), cursors: map[string]cursors{}}
 }
 
-// Poll fetches new events and commits the cursors immediately.
-func (p *Poller) Poll(ctx context.Context) ([]*pluginv1.TrackerEvent, error) {
-	events, next, err := p.fetch(ctx)
+// Poll fetches new events for teams and commits the cursors immediately.
+func (p *Poller) Poll(ctx context.Context, teams []string) ([]*pluginv1.TrackerEvent, error) {
+	events, next, err := p.fetch(ctx, teams)
 	if err != nil {
 		return nil, err
 	}
@@ -53,49 +53,96 @@ func (p *Poller) Poll(ctx context.Context) ([]*pluginv1.TrackerEvent, error) {
 	return events, nil
 }
 
-func (p *Poller) commit(n cursors) {
+func (p *Poller) commit(next map[string]cursors) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if n.assigned.After(p.assigned) {
-		p.assigned = n.assigned
-	}
-	if n.comments.After(p.comments) {
-		p.comments = n.comments
+	for team, n := range next {
+		cur := p.cursors[team]
+		if n.assigned.After(cur.assigned) {
+			cur.assigned = n.assigned
+		}
+		if n.comments.After(cur.comments) {
+			cur.comments = n.comments
+		}
+		p.cursors[team] = cur
 	}
 }
 
-// fetch returns events plus the candidate cursors without committing them.
-func (p *Poller) fetch(ctx context.Context) ([]*pluginv1.TrackerEvent, cursors, error) {
+// snapshot returns the cursors of teams, starting unseen teams at now().
+func (p *Poller) snapshot(teams []string) map[string]cursors {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	snap := make(map[string]cursors, len(teams))
+	for _, team := range teams {
+		cur, ok := p.cursors[team]
+		if !ok {
+			now := p.now()
+			cur = cursors{assigned: now, comments: now}
+			p.cursors[team] = cur
+		}
+		snap[team] = cur
+	}
+	return snap
+}
+
+// earliest returns the minimum cursor pair over all teams.
+func earliest(snap map[string]cursors) cursors {
+	var minimum cursors
+	first := true
+	for _, cur := range snap {
+		if first || cur.assigned.Before(minimum.assigned) {
+			minimum.assigned = cur.assigned
+		}
+		if first || cur.comments.Before(minimum.comments) {
+			minimum.comments = cur.comments
+		}
+		first = false
+	}
+	return minimum
+}
+
+// fetch queries from the earliest cursor of teams and keeps only events after
+// their own team's cursor (minus overlap). It returns the candidate cursors
+// without committing them.
+func (p *Poller) fetch(ctx context.Context, teams []string) ([]*pluginv1.TrackerEvent, map[string]cursors, error) {
 	viewer, err := p.c.Viewer(ctx)
 	if err != nil {
-		return nil, cursors{}, err
+		return nil, nil, err
 	}
-	p.mu.Lock()
-	next := cursors{assigned: p.assigned, comments: p.comments}
-	p.mu.Unlock()
-	assignedSince, commentsSince := next.assigned.Add(-overlap), next.comments.Add(-overlap)
+	next := p.snapshot(teams)
+	since := earliest(next)
 
-	assigned, assignedTruncated, err := p.c.AssignedSince(ctx, p.teams, assignedSince)
+	assigned, assignedTruncated, err := p.c.AssignedSince(ctx, teams, since.assigned.Add(-overlap))
 	if err != nil {
-		return nil, cursors{}, err
+		return nil, nil, err
 	}
-	comments, commentsTruncated, err := p.c.CommentsSince(ctx, p.teams, commentsSince)
+	comments, commentsTruncated, err := p.c.CommentsSince(ctx, teams, since.comments.Add(-overlap))
 	if err != nil {
-		return nil, cursors{}, err
+		return nil, nil, err
 	}
 
 	var events []*pluginv1.TrackerEvent
 	for _, a := range assigned {
-		if !assignedTruncated && a.UpdatedAt.After(next.assigned) {
-			next.assigned = a.UpdatedAt
+		cur, ok := next[a.Team.Key]
+		if !ok {
+			continue
 		}
-		if ev := p.assignmentEvent(a, viewer, assignedSince); ev != nil {
+		if ev := p.assignmentEvent(a, viewer, cur.assigned.Add(-overlap)); ev != nil {
 			events = append(events, ev)
+		}
+		if !assignedTruncated && a.UpdatedAt.After(cur.assigned) {
+			cur.assigned = a.UpdatedAt
+			next[a.Team.Key] = cur
 		}
 	}
 	for _, cm := range comments {
-		if !commentsTruncated && cm.CreatedAt.After(next.comments) {
-			next.comments = cm.CreatedAt
+		cur, ok := next[cm.Issue.Team.Key]
+		if !ok || !cm.CreatedAt.After(cur.comments.Add(-overlap)) {
+			continue
+		}
+		if !commentsTruncated && cm.CreatedAt.After(cur.comments) {
+			cur.comments = cm.CreatedAt
+			next[cm.Issue.Team.Key] = cur
 		}
 		if cm.User == nil || cm.User.ID == viewer.ID { // bot comments and our own: no loops
 			continue
@@ -183,11 +230,11 @@ func hasToken(s, tok string) bool {
 	}
 }
 
-// Run polls, sends, then waits for the interval or a nudge. Poll errors are
+// Run polls teams, sends, then waits for the interval or a nudge. Poll errors are
 // logged and retried on the next tick; it returns on ctx cancel or send error.
-func (p *Poller) Run(ctx context.Context, nudge <-chan struct{}, send func(*pluginv1.TrackerEvent) error) error {
+func (p *Poller) Run(ctx context.Context, teams []string, nudge <-chan struct{}, send func(*pluginv1.TrackerEvent) error) error {
 	for {
-		events, next, err := p.fetch(ctx)
+		events, next, err := p.fetch(ctx, teams)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
