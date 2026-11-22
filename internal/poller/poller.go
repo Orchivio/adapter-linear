@@ -53,6 +53,10 @@ func (p *Poller) Poll(ctx context.Context, teams []string) ([]*pluginv1.TrackerE
 	return events, nil
 }
 
+// ponytail: shared per-team cursors can hide events from a replacement stream while the
+// orchestrator briefly overlaps old and new streams on a key change (send only buffers; a
+// cancelled old stream may not have delivered what it committed). Upgrade: ack-based commit
+// or the orchestrator draining the old stream before opening the new one.
 func (p *Poller) commit(next map[string]cursors) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -101,6 +105,23 @@ func earliest(snap map[string]cursors) cursors {
 	return minimum
 }
 
+// advance raises every requested team to the response's high-water mark: an
+// untruncated response proves no older unseen events exist for any of them,
+// so a quiet team cannot pin the query window.
+func advance(since map[string]cursors, high cursors, assignedTruncated, commentsTruncated bool) map[string]cursors {
+	next := make(map[string]cursors, len(since))
+	for team, cur := range since {
+		if !assignedTruncated && high.assigned.After(cur.assigned) {
+			cur.assigned = high.assigned
+		}
+		if !commentsTruncated && high.comments.After(cur.comments) {
+			cur.comments = high.comments
+		}
+		next[team] = cur
+	}
+	return next
+}
+
 // fetch queries from the earliest cursor of teams and keeps only events after
 // their own team's cursor (minus overlap). It returns the candidate cursors
 // without committing them.
@@ -109,40 +130,40 @@ func (p *Poller) fetch(ctx context.Context, teams []string) ([]*pluginv1.Tracker
 	if err != nil {
 		return nil, nil, err
 	}
-	next := p.snapshot(teams)
-	since := earliest(next)
+	since := p.snapshot(teams)
+	from := earliest(since)
 
-	assigned, assignedTruncated, err := p.c.AssignedSince(ctx, teams, since.assigned.Add(-overlap))
+	assigned, assignedTruncated, err := p.c.AssignedSince(ctx, teams, from.assigned.Add(-overlap))
 	if err != nil {
 		return nil, nil, err
 	}
-	comments, commentsTruncated, err := p.c.CommentsSince(ctx, teams, since.comments.Add(-overlap))
+	comments, commentsTruncated, err := p.c.CommentsSince(ctx, teams, from.comments.Add(-overlap))
 	if err != nil {
 		return nil, nil, err
 	}
 
+	// Filter against the unchanged snapshot: Linear returns newest first.
 	var events []*pluginv1.TrackerEvent
+	var high cursors // newest timestamps seen across all teams
 	for _, a := range assigned {
-		cur, ok := next[a.Team.Key]
+		if a.UpdatedAt.After(high.assigned) {
+			high.assigned = a.UpdatedAt
+		}
+		cur, ok := since[a.Team.Key]
 		if !ok {
 			continue
 		}
 		if ev := p.assignmentEvent(a, viewer, cur.assigned.Add(-overlap)); ev != nil {
 			events = append(events, ev)
 		}
-		if !assignedTruncated && a.UpdatedAt.After(cur.assigned) {
-			cur.assigned = a.UpdatedAt
-			next[a.Team.Key] = cur
-		}
 	}
 	for _, cm := range comments {
-		cur, ok := next[cm.Issue.Team.Key]
+		if cm.CreatedAt.After(high.comments) {
+			high.comments = cm.CreatedAt
+		}
+		cur, ok := since[cm.Issue.Team.Key]
 		if !ok || !cm.CreatedAt.After(cur.comments.Add(-overlap)) {
 			continue
-		}
-		if !commentsTruncated && cm.CreatedAt.After(cur.comments) {
-			cur.comments = cm.CreatedAt
-			next[cm.Issue.Team.Key] = cur
 		}
 		if cm.User == nil || cm.User.ID == viewer.ID { // bot comments and our own: no loops
 			continue
@@ -161,7 +182,7 @@ func (p *Poller) fetch(ctx context.Context, teams []string) ([]*pluginv1.Tracker
 		// ponytail: >500 events per poll re-fetches the same window; raise cap or switch to ascending order
 		p.log.Warn("page cap reached, cursor not advanced", "assignments", assignedTruncated, "comments", commentsTruncated)
 	}
-	return events, next, nil
+	return events, advance(since, high, assignedTruncated, commentsTruncated), nil
 }
 
 // assignmentEvent ignores history entries not newer than since: an issue

@@ -315,3 +315,37 @@ func TestCursorsArePerTeam(t *testing.T) {
 		t.Fatalf("since = %s, want min cursor %s", f.sinces[1], want)
 	}
 }
+
+func TestPollKeepsSameTeamCommentsNewestFirst(t *testing.T) {
+	f := &fake{issues: `[]`, comments: `[` + comment("c2", "b", "u1", t0.Add(10*time.Minute)) + `,` +
+		comment("c1", "a", "u1", t0.Add(5*time.Minute)) + `]`}
+	evs, err := New(f.client(t), at(t0), time.Hour).Poll(context.Background(), orc)
+	if err != nil || len(evs) != 2 {
+		t.Fatalf("evs=%v err=%v, want both comments", evs, err)
+	}
+}
+
+func assignedIssue(id string, at time.Time) string {
+	return `{"id":"` + id + `","identifier":"ORC-` + id + `","updatedAt":"` + at.Format(time.RFC3339) + `","team":{"key":"ORC"},"history":{"nodes":[
+	 {"createdAt":"` + at.Format(time.RFC3339) + `","actor":{"id":"pm","email":"pm@x","name":"PM"},"toAssignee":{"id":"bot"}}]}}`
+}
+
+func TestPollKeepsSameTeamAssignmentsNewestFirst(t *testing.T) {
+	f := &fake{comments: `[]`, issues: `[` + assignedIssue("2", t0.Add(10*time.Minute)) + `,` + assignedIssue("1", t0.Add(5*time.Minute)) + `]`}
+	evs, err := New(f.client(t), at(t0), time.Hour).Poll(context.Background(), orc)
+	if err != nil || len(evs) != 2 {
+		t.Fatalf("evs=%v err=%v, want both assignments", evs, err)
+	}
+}
+
+func TestQuietTeamDoesNotPinQueryWindow(t *testing.T) {
+	last := t0.Add(10 * time.Minute)
+	f := &fake{issues: `[]`, comments: `[` + comment("c1", "a", "u1", last) + `]`}
+	p := New(f.client(t), at(t0), time.Hour)
+	teams := []string{"ORC", "RES"} // RES stays quiet
+	p.Poll(context.Background(), teams)
+	p.Poll(context.Background(), teams)
+	if want := last.Add(-overlap).Format(time.RFC3339Nano); f.sinces[1] != want {
+		t.Fatalf("second since = %s, want %s", f.sinces[1], want)
+	}
+}
