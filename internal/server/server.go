@@ -6,6 +6,8 @@ import (
 	"time"
 
 	pluginv1 "github.com/orchivio/orchestrator/contract/gen/orchivio/plugin/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/orchivio/adapter-linear/internal/linear"
 	"github.com/orchivio/adapter-linear/internal/poller"
@@ -15,34 +17,35 @@ import (
 type Server struct {
 	pluginv1.UnimplementedTrackerAdapterServer
 	client   *linear.Client
-	poller   *poller.Poller // process-level cursors, created at construction
+	poller   *poller.Poller // process-level cursors per team key
 	ctx      context.Context
 	cancel   context.CancelFunc
 	hub      *Hub
-	teams    []string
-	interval time.Duration
 	webhooks bool
-	now      func() time.Time
 }
 
-func New(client *linear.Client, hub *Hub, teams []string, interval time.Duration, webhooks bool, now func() time.Time) *Server {
+func New(client *linear.Client, hub *Hub, interval time.Duration, webhooks bool, now func() time.Time) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Server{client: client, poller: poller.New(client, teams, now(), interval), ctx: ctx, cancel: cancel, hub: hub, teams: teams, interval: interval, webhooks: webhooks, now: now}
+	return &Server{client: client, poller: poller.New(client, now, interval), ctx: ctx, cancel: cancel, hub: hub, webhooks: webhooks}
 }
 
 func (s *Server) GetCapabilities(context.Context, *pluginv1.GetCapabilitiesRequest) (*pluginv1.Capabilities, error) {
 	return &pluginv1.Capabilities{ContractVersion: "plugin.v1", AdapterName: "linear", SupportsWebhooks: s.webhooks}, nil
 }
 
-// StreamEvents runs a dedicated poller per stream until the client goes away.
-func (s *Server) StreamEvents(_ *pluginv1.StreamEventsRequest, stream pluginv1.TrackerAdapter_StreamEventsServer) error {
+// StreamEvents polls the requested team keys until the client goes away.
+func (s *Server) StreamEvents(req *pluginv1.StreamEventsRequest, stream pluginv1.TrackerAdapter_StreamEventsServer) error {
+	teams := req.GetProjectKeys()
+	if len(teams) == 0 {
+		return status.Error(codes.InvalidArgument, "project_keys must not be empty")
+	}
 	nudge, unsubscribe := s.hub.Subscribe()
 	defer unsubscribe()
 	ctx, cancel := context.WithCancel(stream.Context())
 	defer cancel()
 	stop := context.AfterFunc(s.ctx, cancel) // server shutdown ends open streams
 	defer stop()
-	err := s.poller.Run(ctx, nudge, stream.Send)
+	err := s.poller.Run(ctx, teams, nudge, stream.Send)
 	if ctx.Err() != nil {
 		return nil
 	}

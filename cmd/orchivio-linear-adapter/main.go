@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -71,16 +70,6 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	var teams []string
-	for _, t := range strings.Split(os.Getenv("LINEAR_TEAM_KEYS"), ",") {
-		if t = strings.TrimSpace(t); t != "" {
-			teams = append(teams, t)
-		}
-	}
-
-	if len(teams) == 0 {
-		return errors.New("LINEAR_TEAM_KEYS must list at least one team key")
-	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -96,14 +85,14 @@ func run() error {
 	}
 	// ponytail: insecure gRPC, bind localhost; mTLS before remote workers.
 	grpcServer := grpc.NewServer()
-	adapter := server.New(client, hub, teams, interval, webhookSecret != "", time.Now)
+	adapter := server.New(client, hub, interval, webhookSecret != "", time.Now)
 	pluginv1.RegisterTrackerAdapterServer(grpcServer, adapter)
 	httpServer := &http.Server{Addr: env("ORCHIVIO_WEBHOOK_ADDR", ":7102"), Handler: server.WebhookHandler(webhookSecret, hub), ReadHeaderTimeout: 10 * time.Second}
 
 	errs := make(chan error, 2)
 	go func() { errs <- grpcServer.Serve(lis) }()
 	go func() { errs <- httpServer.ListenAndServe() }()
-	slog.Info("linear adapter started", "teams", teams, "webhooks", webhookSecret != "")
+	slog.Info("linear adapter started", "webhooks", webhookSecret != "")
 
 	select {
 	case err = <-errs:

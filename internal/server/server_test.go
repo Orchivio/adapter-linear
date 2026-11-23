@@ -12,55 +12,20 @@ import (
 
 	pluginv1 "github.com/orchivio/orchestrator/contract/gen/orchivio/plugin/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
 	"github.com/orchivio/adapter-linear/internal/linear"
 )
 
-func TestLateStreamSeesEventSinceProcessStart(t *testing.T) {
-	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
-	lin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Query     string
-			Variables struct{ Since string }
-		}
-		json.NewDecoder(r.Body).Decode(&req)
-		switch {
-		case strings.Contains(req.Query, "viewer"):
-			w.Write([]byte(`{"data":{"viewer":{"id":"bot","displayName":"orchivio"}}}`))
-		case strings.Contains(req.Query, "issues("):
-			w.Write([]byte(`{"data":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}`))
-		default:
-			nodes := `[]`
-			if since, _ := time.Parse(time.RFC3339Nano, req.Variables.Since); since.Before(time.Date(2026, 1, 1, 12, 1, 0, 0, time.UTC)) {
-				nodes = `[{"id":"c1","body":"hi","createdAt":"2026-01-01T12:01:00Z","user":{"id":"u1"},"issue":{"identifier":"ORC-1","team":{"key":"ORC"}}}]`
-			}
-			w.Write([]byte(`{"data":{"comments":{"nodes":` + nodes + `,"pageInfo":{"hasNextPage":false}}}}`))
-		}
-	}))
-	defer lin.Close()
-	late := false
-	now := func() time.Time {
-		if late {
-			return t0.Add(time.Hour)
-		}
-		return t0
-	}
-	srv := New(linear.New(lin.URL, "k"), NewHub(), []string{"ORC"}, time.Hour, false, now)
-	late = true // any now() call after construction is much later
+func TestStreamWithoutKeysIsInvalidArgument(t *testing.T) {
+	srv := New(linear.New("http://127.0.0.1:0", "k"), NewHub(), time.Hour, false, time.Now)
 	defer srv.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	stream := &recvStream{ctx: ctx, got: make(chan *pluginv1.TrackerEvent, 1)}
-	go srv.StreamEvents(&pluginv1.StreamEventsRequest{}, stream)
-	select {
-	case ev := <-stream.got:
-		if ev.ExternalId != "comment:c1" {
-			t.Fatalf("ev=%v", ev)
-		}
-	case <-ctx.Done():
-		t.Fatal("late stream missed event created after process start")
+	err := srv.StreamEvents(&pluginv1.StreamEventsRequest{}, &recvStream{ctx: context.Background(), got: make(chan *pluginv1.TrackerEvent, 1)})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("err = %v, want InvalidArgument", err)
 	}
 }
 
@@ -75,10 +40,10 @@ func TestCloseEndsOpenStreams(t *testing.T) {
 		w.Write([]byte(`{"data":{"issues":{"nodes":[],"pageInfo":{}},"comments":{"nodes":[],"pageInfo":{}}}}`))
 	}))
 	defer lin.Close()
-	srv := New(linear.New(lin.URL, "k"), NewHub(), []string{"ORC"}, time.Hour, false, time.Now)
+	srv := New(linear.New(lin.URL, "k"), NewHub(), time.Hour, false, time.Now)
 	done := make(chan error, 1)
 	go func() {
-		done <- srv.StreamEvents(&pluginv1.StreamEventsRequest{}, &recvStream{ctx: context.Background(), got: make(chan *pluginv1.TrackerEvent, 1)})
+		done <- srv.StreamEvents(&pluginv1.StreamEventsRequest{ProjectKeys: []string{"ORC"}}, &recvStream{ctx: context.Background(), got: make(chan *pluginv1.TrackerEvent, 1)})
 	}()
 	srv.Close()
 	select {
@@ -126,7 +91,7 @@ func TestStreamEventsPollsThenNudge(t *testing.T) {
 
 	hub := NewHub()
 	// interval of one hour: only the webhook nudge can trigger the second poll
-	srv := New(linear.New(lin.URL, "k"), hub, []string{"ORC"}, time.Hour, true, func() time.Time { return t0 })
+	srv := New(linear.New(lin.URL, "k"), hub, time.Hour, true, func() time.Time { return t0 })
 	lis := bufconn.Listen(1 << 20)
 	g := grpc.NewServer()
 	pluginv1.RegisterTrackerAdapterServer(g, srv)
@@ -147,7 +112,7 @@ func TestStreamEventsPollsThenNudge(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	stream, err := client.StreamEvents(ctx, &pluginv1.StreamEventsRequest{})
+	stream, err := client.StreamEvents(ctx, &pluginv1.StreamEventsRequest{ProjectKeys: []string{"ORC"}})
 	if err != nil {
 		t.Fatal(err)
 	}
