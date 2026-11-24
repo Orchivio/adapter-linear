@@ -85,7 +85,7 @@ func quote(s string) string { b, _ := json.Marshal(s); return string(b) }
 
 func TestPollSkipsOwnComments(t *testing.T) {
 	f := &fake{issues: `[]`, comments: `[` + comment("c1", "done", "bot", t0.Add(time.Minute)) + `]`}
-	evs, err := New(f.client(t), at(t0), time.Hour).Poll(context.Background(), []string{"ORC"})
+	evs, err := New(at(t0), time.Hour).Poll(context.Background(), f.client(t), org1, []string{"ORC"})
 	if err != nil || len(evs) != 0 {
 		t.Fatalf("evs=%v err=%v", evs, err)
 	}
@@ -93,7 +93,7 @@ func TestPollSkipsOwnComments(t *testing.T) {
 
 func TestPollDropsBotCommentsWithoutUser(t *testing.T) {
 	f := &fake{issues: `[]`, comments: `[` + comment("c1", "hi", "", t0.Add(time.Minute)) + `]`}
-	evs, _ := New(f.client(t), at(t0), time.Hour).Poll(context.Background(), []string{"ORC"})
+	evs, _ := New(at(t0), time.Hour).Poll(context.Background(), f.client(t), org1, []string{"ORC"})
 	if len(evs) != 0 {
 		t.Fatalf("evs=%v", evs)
 	}
@@ -102,7 +102,7 @@ func TestPollDropsBotCommentsWithoutUser(t *testing.T) {
 func TestPollDetectsMention(t *testing.T) {
 	f := &fake{issues: `[]`, comments: `[` + comment("c1", "@orchivio was macht X?", "u1", t0.Add(time.Minute)) + `,` +
 		comment("c2", "plain", "u1", t0.Add(time.Minute)) + `]`}
-	evs, err := New(f.client(t), at(t0), time.Hour).Poll(context.Background(), []string{"ORC"})
+	evs, err := New(at(t0), time.Hour).Poll(context.Background(), f.client(t), org1, []string{"ORC"})
 	if err != nil || len(evs) != 2 {
 		t.Fatalf("evs=%v err=%v", evs, err)
 	}
@@ -139,7 +139,7 @@ func TestPollAssignmentUsesAssigningActor(t *testing.T) {
 	f := &fake{comments: `[]`, issues: `[{"id":"i1","identifier":"ORC-1","updatedAt":"` + t0.Add(time.Minute).Format(time.RFC3339) + `","team":{"key":"ORC"},"history":{"nodes":[
 	 {"createdAt":"` + t0.Add(2*time.Second).Format(time.RFC3339) + `","actor":{"id":"x","email":"other@x","name":"O"},"toAssignee":null},
 	 {"createdAt":"` + t0.Add(time.Second).Format(time.RFC3339) + `","actor":{"id":"pm","email":"pm@x","name":"PM"},"toAssignee":{"id":"bot"}}]}}]`}
-	evs, err := New(f.client(t), at(t0), time.Hour).Poll(context.Background(), []string{"ORC"})
+	evs, err := New(at(t0), time.Hour).Poll(context.Background(), f.client(t), org1, []string{"ORC"})
 	if err != nil || len(evs) != 1 {
 		t.Fatalf("evs=%v err=%v", evs, err)
 	}
@@ -154,7 +154,7 @@ func TestPollAssignmentUsesAssigningActor(t *testing.T) {
 
 func TestPollSkipsAssignmentWithoutHistory(t *testing.T) {
 	f := &fake{comments: `[]`, issues: `[{"id":"i1","identifier":"ORC-1","updatedAt":"` + t0.Format(time.RFC3339) + `","team":{"key":"ORC"},"history":{"nodes":[]}}]`}
-	evs, _ := New(f.client(t), at(t0), time.Hour).Poll(context.Background(), []string{"ORC"})
+	evs, _ := New(at(t0), time.Hour).Poll(context.Background(), f.client(t), org1, []string{"ORC"})
 	if len(evs) != 0 {
 		t.Fatalf("evs=%v", evs)
 	}
@@ -163,9 +163,9 @@ func TestPollSkipsAssignmentWithoutHistory(t *testing.T) {
 func TestPollAdvancesCursor(t *testing.T) {
 	last := t0.Add(time.Minute)
 	f := &fake{issues: `[]`, comments: `[` + comment("c1", "hi", "u1", last) + `]`}
-	p := New(f.client(t), at(t0), time.Hour)
-	p.Poll(context.Background(), orc)
-	p.Poll(context.Background(), orc)
+	p := New(at(t0), time.Hour)
+	p.Poll(context.Background(), f.client(t), org1, orc)
+	p.Poll(context.Background(), f.client(t), org1, orc)
 	if f.sinces[0] != t0.Add(-overlap).Format(time.RFC3339Nano) {
 		t.Fatalf("first since = %s", f.sinces[0])
 	}
@@ -176,12 +176,12 @@ func TestPollAdvancesCursor(t *testing.T) {
 
 func TestRunNudgeTriggersImmediatePoll(t *testing.T) {
 	f := &fake{issues: `[]`, comments: `[` + comment("c1", "hi", "u1", t0.Add(time.Minute)) + `]`}
-	p := New(f.client(t), at(t0), time.Hour)
+	p := New(at(t0), time.Hour)
 	nudge := make(chan struct{}, 1)
 	got := make(chan *pluginv1.TrackerEvent)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go p.Run(ctx, orc, nudge, func(ev *pluginv1.TrackerEvent) error { got <- ev; return nil })
+	go p.Run(ctx, f.client(t), org1, orc, nudge, func(ev *pluginv1.TrackerEvent) error { got <- ev; return nil })
 	<-got // first poll
 	nudge <- struct{}{}
 	<-got // second poll only possible via nudge (interval = 1h)
@@ -189,9 +189,9 @@ func TestRunNudgeTriggersImmediatePoll(t *testing.T) {
 
 func TestRunSendFailureRedeliversOnNextStream(t *testing.T) {
 	f := &fake{issues: `[]`, comments: `[` + comment("c1", "a", "u1", t0.Add(time.Minute)) + `,` + comment("c2", "b", "u1", t0.Add(2*time.Minute)) + `]`}
-	p := New(f.client(t), at(t0), time.Hour)
+	p := New(at(t0), time.Hour)
 	sent := 0
-	err := p.Run(context.Background(), orc, nil, func(*pluginv1.TrackerEvent) error {
+	err := p.Run(context.Background(), f.client(t), org1, orc, nil, func(*pluginv1.TrackerEvent) error {
 		sent++
 		if sent == 2 {
 			return context.Canceled
@@ -204,7 +204,7 @@ func TestRunSendFailureRedeliversOnNextStream(t *testing.T) {
 	var ids []string
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	p.Run(ctx, orc, nil, func(ev *pluginv1.TrackerEvent) error {
+	p.Run(ctx, f.client(t), org1, orc, nil, func(ev *pluginv1.TrackerEvent) error {
 		ids = append(ids, ev.ExternalId)
 		if len(ids) == 2 {
 			cancel()
@@ -218,10 +218,10 @@ func TestRunSendFailureRedeliversOnNextStream(t *testing.T) {
 
 func TestPollDoesNotAdvanceCursorWhenPageCapHit(t *testing.T) {
 	f := &fake{issues: `[]`, hasNext: true, comments: `[` + comment("c1", "a", "u1", t0.Add(time.Minute)) + `]`}
-	p := New(f.client(t), at(t0), time.Hour)
-	p.Poll(context.Background(), orc)
+	p := New(at(t0), time.Hour)
+	p.Poll(context.Background(), f.client(t), org1, orc)
 	f.sinces = nil
-	p.Poll(context.Background(), orc)
+	p.Poll(context.Background(), f.client(t), org1, orc)
 	if want := t0.Add(-overlap).Format(time.RFC3339Nano); f.sinces[0] != want {
 		t.Fatalf("since = %s, want unchanged %s", f.sinces[0], want)
 	}
@@ -230,7 +230,7 @@ func TestPollDoesNotAdvanceCursorWhenPageCapHit(t *testing.T) {
 func TestPollIgnoresStaleAssignmentHistory(t *testing.T) {
 	f := &fake{comments: `[]`, issues: `[{"id":"i1","identifier":"ORC-1","updatedAt":"` + t0.Add(time.Minute).Format(time.RFC3339) + `","team":{"key":"ORC"},"history":{"nodes":[
 	 {"createdAt":"` + t0.Add(-time.Hour).Format(time.RFC3339) + `","actor":{"id":"pm","email":"pm@x","name":"PM"},"toAssignee":{"id":"bot"}}]}}]`}
-	evs, _ := New(f.client(t), at(t0), time.Hour).Poll(context.Background(), []string{"ORC"})
+	evs, _ := New(at(t0), time.Hour).Poll(context.Background(), f.client(t), org1, []string{"ORC"})
 	if len(evs) != 0 {
 		t.Fatalf("evs=%v", evs)
 	}
@@ -239,7 +239,7 @@ func TestPollIgnoresStaleAssignmentHistory(t *testing.T) {
 func TestPollDelegationToAppUserIsAssignment(t *testing.T) {
 	f := &fake{comments: `[]`, issues: `[{"id":"i1","identifier":"ORC-1","updatedAt":"` + t0.Add(time.Minute).Format(time.RFC3339) + `","team":{"key":"ORC"},"history":{"nodes":[
 	 {"createdAt":"` + t0.Add(time.Second).Format(time.RFC3339) + `","actor":{"id":"pm","email":"pm@x","name":"PM"},"toAssignee":null,"toDelegate":{"id":"bot"}}]}}]`}
-	evs, err := New(f.client(t), at(t0), time.Hour).Poll(context.Background(), []string{"ORC"})
+	evs, err := New(at(t0), time.Hour).Poll(context.Background(), f.client(t), org1, []string{"ORC"})
 	if err != nil || len(evs) != 1 || evs[0].Kind != pluginv1.TrackerEvent_ASSIGNED || evs[0].Actor.Email != "pm@x" {
 		t.Fatalf("evs=%v err=%v", evs, err)
 	}
@@ -249,7 +249,7 @@ func TestPollIssueCreatedDelegatedToAppUserIsAssignment(t *testing.T) {
 	created := t0.Add(time.Second)
 	f := &fake{comments: `[]`, issues: `[{"id":"i1","identifier":"RES-9","createdAt":"` + created.Format(time.RFC3339) + `","updatedAt":"` + created.Format(time.RFC3339) + `","team":{"key":"RES"},
 	 "creator":{"id":"pm","email":"pm@x","name":"PM"},"assignee":{"id":"pm"},"delegate":{"id":"bot"},"history":{"nodes":[]}}]`}
-	evs, err := New(f.client(t), at(t0), time.Hour).Poll(context.Background(), []string{"RES"})
+	evs, err := New(at(t0), time.Hour).Poll(context.Background(), f.client(t), org1, []string{"RES"})
 	if err != nil || len(evs) != 1 || evs[0].Kind != pluginv1.TrackerEvent_ASSIGNED || evs[0].Actor.Email != "pm@x" {
 		t.Fatalf("evs=%v err=%v", evs, err)
 	}
@@ -261,7 +261,7 @@ func TestPollIssueCreatedDelegatedToAppUserIsAssignment(t *testing.T) {
 func TestPollIgnoresOldIssueDelegatedWithoutHistory(t *testing.T) {
 	f := &fake{comments: `[]`, issues: `[{"id":"i1","identifier":"RES-9","createdAt":"` + t0.Add(-time.Hour).Format(time.RFC3339) + `","updatedAt":"` + t0.Add(time.Minute).Format(time.RFC3339) + `","team":{"key":"RES"},
 	 "creator":{"id":"pm","email":"pm@x","name":"PM"},"delegate":{"id":"bot"},"history":{"nodes":[]}}]`}
-	evs, _ := New(f.client(t), at(t0), time.Hour).Poll(context.Background(), []string{"RES"})
+	evs, _ := New(at(t0), time.Hour).Poll(context.Background(), f.client(t), org1, []string{"RES"})
 	if len(evs) != 0 {
 		t.Fatalf("evs=%v", evs)
 	}
@@ -269,12 +269,14 @@ func TestPollIgnoresOldIssueDelegatedWithoutHistory(t *testing.T) {
 
 var orc = []string{"ORC"}
 
+const org1 = "org-1"
+
 // at is a fixed clock.
 func at(t time.Time) func() time.Time { return func() time.Time { return t } }
 
 func TestPollUsesRequestedTeams(t *testing.T) {
 	f := &fake{issues: `[]`, comments: `[]`}
-	if _, err := New(f.client(t), at(t0), time.Hour).Poll(context.Background(), []string{"RES"}); err != nil {
+	if _, err := New(at(t0), time.Hour).Poll(context.Background(), f.client(t), org1, []string{"RES"}); err != nil {
 		t.Fatal(err)
 	}
 	if len(f.teams) != 1 || f.teams[0] != "RES" {
@@ -285,9 +287,9 @@ func TestPollUsesRequestedTeams(t *testing.T) {
 func TestNewTeamStartsAtNow(t *testing.T) {
 	now := t0
 	f := &fake{issues: `[]`, comments: `[` + comment("c1", "old", "u1", t0.Add(30*time.Minute)) + `]`}
-	p := New(f.client(t), func() time.Time { return now }, time.Hour)
+	p := New(func() time.Time { return now }, time.Hour)
 	now = t0.Add(time.Hour) // ORC is first seen an hour after construction
-	evs, err := p.Poll(context.Background(), orc)
+	evs, err := p.Poll(context.Background(), f.client(t), org1, orc)
 	if err != nil || len(evs) != 0 {
 		t.Fatalf("evs=%v err=%v", evs, err)
 	}
@@ -298,13 +300,13 @@ func TestNewTeamStartsAtNow(t *testing.T) {
 
 func TestCursorsArePerTeam(t *testing.T) {
 	f := &fake{issues: `[]`, comments: `[` + commentIn("RES", "r1", "res", "u1", t0.Add(10*time.Minute)) + `]`}
-	p := New(f.client(t), at(t0), time.Hour)
-	if _, err := p.Poll(context.Background(), []string{"RES"}); err != nil { // RES cursor -> t0+10m
+	p := New(at(t0), time.Hour)
+	if _, err := p.Poll(context.Background(), f.client(t), org1, []string{"RES"}); err != nil { // RES cursor -> t0+10m
 		t.Fatal(err)
 	}
 	f.comments = `[` + commentIn("ORC", "o1", "orc", "u1", t0.Add(5*time.Minute)) + `,` +
 		commentIn("RES", "r0", "res old", "u1", t0.Add(5*time.Minute)) + `]`
-	evs, err := p.Poll(context.Background(), []string{"ORC", "RES"})
+	evs, err := p.Poll(context.Background(), f.client(t), org1, []string{"ORC", "RES"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,7 +321,7 @@ func TestCursorsArePerTeam(t *testing.T) {
 func TestPollKeepsSameTeamCommentsNewestFirst(t *testing.T) {
 	f := &fake{issues: `[]`, comments: `[` + comment("c2", "b", "u1", t0.Add(10*time.Minute)) + `,` +
 		comment("c1", "a", "u1", t0.Add(5*time.Minute)) + `]`}
-	evs, err := New(f.client(t), at(t0), time.Hour).Poll(context.Background(), orc)
+	evs, err := New(at(t0), time.Hour).Poll(context.Background(), f.client(t), org1, orc)
 	if err != nil || len(evs) != 2 {
 		t.Fatalf("evs=%v err=%v, want both comments", evs, err)
 	}
@@ -332,7 +334,7 @@ func assignedIssue(id string, at time.Time) string {
 
 func TestPollKeepsSameTeamAssignmentsNewestFirst(t *testing.T) {
 	f := &fake{comments: `[]`, issues: `[` + assignedIssue("2", t0.Add(10*time.Minute)) + `,` + assignedIssue("1", t0.Add(5*time.Minute)) + `]`}
-	evs, err := New(f.client(t), at(t0), time.Hour).Poll(context.Background(), orc)
+	evs, err := New(at(t0), time.Hour).Poll(context.Background(), f.client(t), org1, orc)
 	if err != nil || len(evs) != 2 {
 		t.Fatalf("evs=%v err=%v, want both assignments", evs, err)
 	}
@@ -341,11 +343,29 @@ func TestPollKeepsSameTeamAssignmentsNewestFirst(t *testing.T) {
 func TestQuietTeamDoesNotPinQueryWindow(t *testing.T) {
 	last := t0.Add(10 * time.Minute)
 	f := &fake{issues: `[]`, comments: `[` + comment("c1", "a", "u1", last) + `]`}
-	p := New(f.client(t), at(t0), time.Hour)
+	p := New(at(t0), time.Hour)
 	teams := []string{"ORC", "RES"} // RES stays quiet
-	p.Poll(context.Background(), teams)
-	p.Poll(context.Background(), teams)
+	p.Poll(context.Background(), f.client(t), org1, teams)
+	p.Poll(context.Background(), f.client(t), org1, teams)
 	if want := last.Add(-overlap).Format(time.RFC3339Nano); f.sinces[1] != want {
 		t.Fatalf("second since = %s, want %s", f.sinces[1], want)
+	}
+}
+
+func TestCursorsAreSeparatedPerWorkspace(t *testing.T) {
+	f := &fake{issues: `[]`, comments: `[` + commentIn("RES", "r1", "new", "u1", t0.Add(10*time.Minute)) + `]`}
+	p := New(at(t0), time.Hour)
+	res := []string{"RES"}
+	if _, err := p.Poll(context.Background(), f.client(t), org1, res); err != nil { // org-1/RES -> t0+10m
+		t.Fatal(err)
+	}
+	f.comments = `[` + commentIn("RES", "r0", "other workspace", "u1", t0.Add(5*time.Minute)) + `]`
+	evs, err := p.Poll(context.Background(), f.client(t), "org-2", res)
+	if err != nil || len(evs) != 1 || evs[0].ExternalId != "comment:r0" {
+		t.Fatalf("org-2 evs=%v err=%v, want comment:r0 from its own cursor", evs, err)
+	}
+	p.Poll(context.Background(), f.client(t), org1, res)
+	if want := t0.Add(10*time.Minute - overlap).Format(time.RFC3339Nano); f.sinces[2] != want {
+		t.Fatalf("org-1 since = %s, want %s", f.sinces[2], want)
 	}
 }

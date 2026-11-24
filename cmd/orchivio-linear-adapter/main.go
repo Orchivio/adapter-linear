@@ -37,26 +37,28 @@ func env(name, def string) string {
 	return def
 }
 
-// newClient acts as the OAuth app user when LINEAR_CLIENT_ID is set,
-// otherwise as the owner of a personal API key.
-func newClient(resolver secretref.Env) (*linear.Client, error) {
-	if id := os.Getenv("LINEAR_CLIENT_ID"); id != "" {
-		secret, err := resolver.Resolve(os.Getenv("LINEAR_CLIENT_SECRET_REF"))
-		if err != nil {
-			return nil, err
-		}
-		return linear.NewApp(linear.DefaultEndpoint, env("LINEAR_TOKEN_URL", linear.DefaultTokenURL), id, secret), nil
+// newOAuth configures the installation's Linear OAuth app; workspaces connect through it.
+func newOAuth(resolver secretref.Env) (*linear.OAuth, error) {
+	id := os.Getenv("LINEAR_CLIENT_ID")
+	if id == "" {
+		return nil, errors.New("LINEAR_CLIENT_ID is required")
 	}
-	apiKey, err := resolver.Resolve(os.Getenv("LINEAR_API_KEY_REF"))
+	secret, err := resolver.Resolve(os.Getenv("LINEAR_CLIENT_SECRET_REF"))
 	if err != nil {
 		return nil, err
 	}
-	return linear.New(linear.DefaultEndpoint, apiKey), nil
+	return &linear.OAuth{
+		APIURL:       env("LINEAR_API_URL", linear.DefaultAPIURL),
+		OAuthURL:     env("LINEAR_OAUTH_URL", linear.DefaultOAuthURL),
+		ClientID:     id,
+		ClientSecret: secret,
+		Now:          time.Now,
+	}, nil
 }
 
 func run() error {
 	resolver := secretref.Env{Lookup: os.LookupEnv}
-	client, err := newClient(resolver)
+	oauth, err := newOAuth(resolver)
 	if err != nil {
 		return err
 	}
@@ -74,10 +76,6 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if _, err := client.Viewer(ctx); err != nil { // fail fast on a bad key
-		return err
-	}
-
 	hub := server.NewHub()
 	lis, err := net.Listen("tcp", env("ORCHIVIO_GRPC_ADDR", "127.0.0.1:7101"))
 	if err != nil {
@@ -85,7 +83,7 @@ func run() error {
 	}
 	// ponytail: insecure gRPC, bind localhost; mTLS before remote workers.
 	grpcServer := grpc.NewServer()
-	adapter := server.New(client, hub, interval, webhookSecret != "", time.Now)
+	adapter := server.New(oauth, hub, interval, webhookSecret != "")
 	pluginv1.RegisterTrackerAdapterServer(grpcServer, adapter)
 	httpServer := &http.Server{Addr: env("ORCHIVIO_WEBHOOK_ADDR", ":7102"), Handler: server.WebhookHandler(webhookSecret, hub), ReadHeaderTimeout: 10 * time.Second}
 
