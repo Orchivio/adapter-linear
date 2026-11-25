@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -12,18 +13,22 @@ import (
 	"time"
 )
 
+// ErrUnauthenticated marks a revoked or expired access token or refresh grant.
+var ErrUnauthenticated = errors.New("linear: access token or grant no longer valid")
+
+// ErrNotFound marks a ticket that does not exist or is not visible to the app.
+var ErrNotFound = errors.New("linear: not found")
+
 const (
-	// DefaultEndpoint is Linear's public GraphQL endpoint.
-	DefaultEndpoint = "https://api.linear.app/graphql"
-	pageSize        = 100
-	maxPages        = 5 // ponytail: cap per poll; add continuation if a team exceeds 500 changes per interval
-	requestTimeout  = 30 * time.Second
+	pageSize       = 100
+	maxPages       = 5 // ponytail: cap per poll; add continuation if a team exceeds 500 changes per interval
+	requestTimeout = 30 * time.Second
 )
 
-// Client talks to Linear. Safe for concurrent use.
+// Client talks to Linear as one workspace's app user. Safe for concurrent use.
 type Client struct {
 	endpoint string
-	auth     func(ctx context.Context, renew bool) (string, error) // Authorization header value
+	token    string // OAuth access token, sent as Bearer
 	http     *http.Client
 
 	mu     sync.Mutex
@@ -31,15 +36,12 @@ type Client struct {
 	ids    map[string]string // identifier -> issue UUID
 }
 
-// New creates a client for a personal API key, sent raw (no "Bearer").
-func New(endpoint, apiKey string) *Client {
-	c := newClient(endpoint)
-	c.auth = func(context.Context, bool) (string, error) { return apiKey, nil }
-	return c
-}
+// httpClient is shared so connections are reused across per-call clients.
+var httpClient = &http.Client{Timeout: requestTimeout}
 
-func newClient(endpoint string) *Client {
-	return &Client{endpoint: endpoint, http: &http.Client{Timeout: requestTimeout}, ids: map[string]string{}}
+// New creates a client for the GraphQL endpoint and an OAuth access token.
+func New(endpoint, accessToken string) *Client {
+	return &Client{endpoint: endpoint, token: accessToken, http: httpClient, ids: map[string]string{}}
 }
 
 type Viewer struct {
@@ -127,6 +129,10 @@ const (
 
 	issueQuery = `query($ref: String!) { issue(id: $ref) { id identifier title description url labels { nodes { name } } } }`
 
+	organizationQuery = `query { organization { id name } }`
+
+	teamsQuery = `query($after: String) { teams(first: 100, after: $after) { nodes { key } pageInfo { hasNextPage endCursor } } }`
+
 	commentCreateMutation = `mutation($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } } }`
 )
 
@@ -135,15 +141,14 @@ func (c *Client) do(ctx context.Context, query string, vars map[string]any, out 
 	if err != nil {
 		return fmt.Errorf("linear: encode request: %w", err)
 	}
-	resp, err := c.post(ctx, payload, false)
-	if err == nil && resp.StatusCode == http.StatusUnauthorized {
-		resp.Body.Close() // token revoked or expired early: renew once
-		resp, err = c.post(ctx, payload, true)
-	}
+	resp, err := c.post(ctx, payload)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("%w (http 401)", ErrUnauthenticated)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return fmt.Errorf("linear: http status %d", resp.StatusCode)
 	}
@@ -169,17 +174,13 @@ func (c *Client) do(ctx context.Context, query string, vars map[string]any, out 
 	return nil
 }
 
-func (c *Client) post(ctx context.Context, payload []byte, renew bool) (*http.Response, error) {
-	auth, err := c.auth(ctx, renew)
-	if err != nil {
-		return nil, err
-	}
+func (c *Client) post(ctx context.Context, payload []byte) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("linear: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", auth)
+	req.Header.Set("Authorization", "Bearer "+c.token)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		// url.Error carries the URL only, never headers.
@@ -277,7 +278,7 @@ func (c *Client) issueNode(ctx context.Context, ref string) (issueNode, error) {
 		return issueNode{}, err
 	}
 	if d.Issue == nil {
-		return issueNode{}, fmt.Errorf("linear: issue %q not found", ref)
+		return issueNode{}, fmt.Errorf("%w: issue %q", ErrNotFound, ref)
 	}
 	c.mu.Lock()
 	c.ids[ref] = d.Issue.ID
@@ -313,4 +314,32 @@ func (c *Client) CreateComment(ctx context.Context, ref, body string) (string, e
 		return "", fmt.Errorf("linear: commentCreate on %q was not successful", ref)
 	}
 	return d.CommentCreate.Comment.ID, nil
+}
+
+// Organization returns the workspace the access token belongs to.
+func (c *Client) Organization(ctx context.Context) (id, name string, err error) {
+	var d struct {
+		Organization struct{ ID, Name string } `json:"organization"`
+	}
+	if err := c.do(ctx, organizationQuery, nil, &d); err != nil {
+		return "", "", err
+	}
+	if d.Organization.ID == "" {
+		return "", "", errors.New("linear: organization without id")
+	}
+	return d.Organization.ID, d.Organization.Name, nil
+}
+
+// TeamKeys lists the keys of all teams the app user can access.
+// ponytail: capped at maxPages*100 teams; keys beyond the cap read as denied.
+func (c *Client) TeamKeys(ctx context.Context) ([]string, error) {
+	teams, _, err := paginate[struct{ Key string }](ctx, c, teamsQuery, "teams", map[string]any{})
+	if err != nil {
+		return nil, err
+	}
+	keys := make([]string, len(teams))
+	for i, t := range teams {
+		keys[i] = t.Key
+	}
+	return keys, nil
 }

@@ -3,24 +3,25 @@ package linear
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
 
-func TestClientSendsRawAPIKey(t *testing.T) {
+func TestClientSendsBearerAccessToken(t *testing.T) {
 	var got string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got = r.Header.Get("Authorization")
 		w.Write([]byte(`{"data":{"viewer":{"id":"u1","name":"orchivio","displayName":"orchivio","email":"o@x"}}}`))
 	}))
 	defer srv.Close()
-	v, err := New(srv.URL, "lin_api_key").Viewer(context.Background())
+	v, err := New(srv.URL, "at-1").Viewer(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "lin_api_key" {
+	if got != "Bearer at-1" {
 		t.Fatalf("Authorization = %q", got)
 	}
 	if v.ID != "u1" {
@@ -103,5 +104,27 @@ func TestIssueMapsLabelNames(t *testing.T) {
 	is, err := New(srv.URL, "k").Issue(context.Background(), "ORC-2")
 	if err != nil || strings.Join(is.Labels, ",") != "bug,orchivio" || is.Title != "T" {
 		t.Fatalf("%+v %v", is, err)
+	}
+}
+
+func TestClient401IsUnauthenticated(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "expired", http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+	_, err := New(srv.URL, "at-1").Viewer(context.Background())
+	if !errors.Is(err, ErrUnauthenticated) || strings.Contains(err.Error(), "at-1") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestTeamKeysListsAccessibleTeams(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data":{"teams":{"nodes":[{"key":"RES"},{"key":"ORC"}],"pageInfo":{"hasNextPage":false}}}}`))
+	}))
+	defer srv.Close()
+	keys, err := New(srv.URL, "at-1").TeamKeys(context.Background())
+	if err != nil || strings.Join(keys, ",") != "RES,ORC" {
+		t.Fatalf("keys=%v err=%v", keys, err)
 	}
 }
