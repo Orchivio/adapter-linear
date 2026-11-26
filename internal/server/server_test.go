@@ -299,3 +299,26 @@ func TestDisconnectIgnoresRevokeFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestSetStatusUnknownStateIsFailedPrecondition(t *testing.T) {
+	srv := (&fakeLinear{}).server(t)
+	_, err := srv.SetStatus(context.Background(), &pluginv1.SetStatusRequest{TicketRef: "ORC-1", Status: "Nope", Credential: cred("at-1", "org-1")})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "status Nope not found for ORC-1") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestSetStatusMalformedCredentialIsInvalidArgument(t *testing.T) {
+	srv := (&fakeLinear{}).server(t)
+	_, err := srv.SetStatus(context.Background(), &pluginv1.SetStatusRequest{TicketRef: "ORC-1", Status: "Done"})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestCapabilitiesSupportStatusUpdate(t *testing.T) {
+	caps, err := (&fakeLinear{}).server(t).GetCapabilities(context.Background(), &pluginv1.GetCapabilitiesRequest{})
+	if err != nil || !caps.GetSupportsStatusUpdate() || caps.GetAdapterName() != "linear" {
+		t.Fatalf("caps=%v err=%v", caps, err)
+	}
+}

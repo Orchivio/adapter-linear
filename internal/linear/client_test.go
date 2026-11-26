@@ -128,3 +128,52 @@ func TestTeamKeysListsAccessibleTeams(t *testing.T) {
 		t.Fatalf("keys=%v err=%v", keys, err)
 	}
 }
+
+// statusServer answers issue, workflowStates and issueUpdate; mutations collects issueUpdate variables.
+func statusServer(t *testing.T, currentState string, mutations *[]map[string]any) *Client {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "issueUpdate"):
+			*mutations = append(*mutations, req.Variables)
+			w.Write([]byte(`{"data":{"issueUpdate":{"success":true}}}`))
+		case strings.Contains(req.Query, "workflowStates"):
+			w.Write([]byte(`{"data":{"workflowStates":{"nodes":[{"id":"s-todo","name":"Todo"},{"id":"s-prog","name":"In Progress"}],"pageInfo":{"hasNextPage":false}}}}`))
+		default:
+			w.Write([]byte(`{"data":{"issue":{"id":"uuid-1","identifier":"ORC-1","labels":{"nodes":[]},"state":{"name":"` + currentState + `"},"team":{"id":"team-1"}}}}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return New(srv.URL, "k")
+}
+
+func TestSetStatusMovesIssue(t *testing.T) {
+	var mutations []map[string]any
+	changed, err := statusServer(t, "Todo", &mutations).SetStatus(context.Background(), "ORC-1", "in progress")
+	if err != nil || !changed {
+		t.Fatalf("changed=%v err=%v", changed, err)
+	}
+	if len(mutations) != 1 || mutations[0]["id"] != "uuid-1" || mutations[0]["stateId"] != "s-prog" {
+		t.Fatalf("mutations = %v", mutations)
+	}
+}
+
+func TestSetStatusAlreadyThere(t *testing.T) {
+	var mutations []map[string]any
+	changed, err := statusServer(t, "In Progress", &mutations).SetStatus(context.Background(), "ORC-1", "IN PROGRESS")
+	if err != nil || changed || len(mutations) != 0 {
+		t.Fatalf("changed=%v err=%v mutations=%v", changed, err, mutations)
+	}
+}
+
+func TestSetStatusUnknownState(t *testing.T) {
+	var mutations []map[string]any
+	_, err := statusServer(t, "Todo", &mutations).SetStatus(context.Background(), "ORC-1", "Shipped")
+	if !errors.Is(err, ErrStatusNotFound) || !strings.Contains(err.Error(), "status Shipped not found for ORC-1") || len(mutations) != 0 {
+		t.Fatalf("err=%v mutations=%v", err, mutations)
+	}
+}

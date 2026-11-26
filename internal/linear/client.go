@@ -16,6 +16,9 @@ import (
 // ErrUnauthenticated marks a revoked or expired access token or refresh grant.
 var ErrUnauthenticated = errors.New("linear: access token or grant no longer valid")
 
+// ErrStatusNotFound marks a status name the ticket's team has no workflow state for.
+var ErrStatusNotFound = errors.New("linear: status not found")
+
 // ErrNotFound marks a ticket that does not exist or is not visible to the app.
 var ErrNotFound = errors.New("linear: not found")
 
@@ -52,9 +55,10 @@ type Viewer struct {
 }
 
 type User struct {
-	ID    string `json:"id"`
-	Email string `json:"email"`
-	Name  string `json:"name"`
+	ID          string `json:"id"`
+	Email       string `json:"email"`
+	Name        string `json:"name"`
+	DisplayName string `json:"displayName"`
 }
 
 type HistoryEntry struct {
@@ -115,19 +119,25 @@ const (
 
 	assignedQuery = `query($teams: [String!], $since: DateTimeOrDuration!, $after: String) {
   issues(first: 100, after: $after, filter: { or: [{ assignee: { isMe: { eq: true } } }, { delegate: { isMe: { eq: true } } }], updatedAt: { gt: $since }, team: { key: { in: $teams } } }) {
-    nodes { id identifier createdAt updatedAt creator { id email name } assignee { id } delegate { id } team { key } history(first: 50) { nodes { createdAt actor { id email name } toAssignee { id } toDelegate { id } } } }
+    nodes { id identifier createdAt updatedAt creator { id email name displayName } assignee { id } delegate { id } team { key } history(first: 50) { nodes { createdAt actor { id email name displayName } toAssignee { id } toDelegate { id } } } }
     pageInfo { hasNextPage endCursor }
   }
 }`
 
 	commentsQuery = `query($teams: [String!], $since: DateTimeOrDuration!, $after: String) {
   comments(first: 100, after: $after, filter: { createdAt: { gt: $since }, issue: { team: { key: { in: $teams } } } }) {
-    nodes { id body createdAt user { id email name } issue { identifier team { key } } }
+    nodes { id body createdAt user { id email name displayName } issue { identifier team { key } } }
     pageInfo { hasNextPage endCursor }
   }
 }`
 
 	issueQuery = `query($ref: String!) { issue(id: $ref) { id identifier title description url labels { nodes { name } } } }`
+
+	issueStateQuery = `query($ref: String!) { issue(id: $ref) { id state { name } team { id } } }`
+
+	workflowStatesQuery = `query($team: ID!, $after: String) { workflowStates(first: 100, after: $after, filter: { team: { id: { eq: $team } } }) { nodes { id name } pageInfo { hasNextPage endCursor } } }`
+
+	issueUpdateMutation = `mutation($id: String!, $stateId: String!) { issueUpdate(id: $id, input: { stateId: $stateId }) { success } }`
 
 	organizationQuery = `query { organization { id name } }`
 
@@ -342,4 +352,51 @@ func (c *Client) TeamKeys(ctx context.Context) ([]string, error) {
 		keys[i] = t.Key
 	}
 	return keys, nil
+}
+
+// SetStatus moves the ticket to the team workflow state named status (case-insensitive).
+// It reports false without a mutation when the ticket already is in that state.
+func (c *Client) SetStatus(ctx context.Context, ref, status string) (bool, error) {
+	var d struct {
+		Issue *struct {
+			ID    string `json:"id"`
+			State struct {
+				Name string `json:"name"`
+			} `json:"state"`
+			Team struct {
+				ID string `json:"id"`
+			} `json:"team"`
+		} `json:"issue"`
+	}
+	if err := c.do(ctx, issueStateQuery, map[string]any{"ref": ref}, &d); err != nil {
+		return false, err
+	}
+	if d.Issue == nil {
+		return false, fmt.Errorf("%w: issue %q", ErrNotFound, ref)
+	}
+	if strings.EqualFold(d.Issue.State.Name, status) {
+		return false, nil
+	}
+	states, _, err := paginate[struct{ ID, Name string }](ctx, c, workflowStatesQuery, "workflowStates", map[string]any{"team": d.Issue.Team.ID})
+	if err != nil {
+		return false, err
+	}
+	for _, st := range states {
+		if !strings.EqualFold(st.Name, status) {
+			continue
+		}
+		var u struct {
+			IssueUpdate struct {
+				Success bool `json:"success"`
+			} `json:"issueUpdate"`
+		}
+		if err := c.do(ctx, issueUpdateMutation, map[string]any{"id": d.Issue.ID, "stateId": st.ID}, &u); err != nil {
+			return false, err
+		}
+		if !u.IssueUpdate.Success {
+			return false, fmt.Errorf("linear: issueUpdate on %q was not successful", ref)
+		}
+		return true, nil
+	}
+	return false, fmt.Errorf("%w: status %s not found for %s", ErrStatusNotFound, status, ref)
 }
