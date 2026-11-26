@@ -76,7 +76,7 @@ func comment(id, body, userID string, at time.Time) string {
 func commentIn(team, id, body, userID string, at time.Time) string {
 	user := `null`
 	if userID != "" {
-		user = `{"id":"` + userID + `","email":"` + userID + `@x","name":"N"}`
+		user = `{"id":"` + userID + `","email":"` + userID + `@x","name":"N","displayName":"dn-` + userID + `"}`
 	}
 	return `{"id":"` + id + `","body":` + quote(body) + `,"createdAt":"` + at.Format(time.RFC3339Nano) + `","user":` + user + `,"issue":{"identifier":"` + team + `-1","team":{"key":"` + team + `"}}}`
 }
@@ -109,7 +109,7 @@ func TestPollDetectsMention(t *testing.T) {
 	if !evs[0].MentionsBot || evs[1].MentionsBot {
 		t.Fatalf("mentions: %v %v", evs[0].MentionsBot, evs[1].MentionsBot)
 	}
-	if evs[0].ExternalId != "comment:c1" || evs[0].Kind != pluginv1.TrackerEvent_COMMENTED || evs[0].ProjectKey != "ORC" || evs[0].Actor.Email != "u1@x" {
+	if evs[0].ExternalId != "comment:c1" || evs[0].Kind != pluginv1.TrackerEvent_COMMENTED || evs[0].ProjectKey != "ORC" || evs[0].Actor.Email != "u1@x" || evs[0].Actor.Username != "dn-u1" {
 		t.Fatalf("ev=%v", evs[0])
 	}
 }
@@ -138,13 +138,13 @@ func TestMentionsBoundaries(t *testing.T) {
 func TestPollAssignmentUsesAssigningActor(t *testing.T) {
 	f := &fake{comments: `[]`, issues: `[{"id":"i1","identifier":"ORC-1","updatedAt":"` + t0.Add(time.Minute).Format(time.RFC3339) + `","team":{"key":"ORC"},"history":{"nodes":[
 	 {"createdAt":"` + t0.Add(2*time.Second).Format(time.RFC3339) + `","actor":{"id":"x","email":"other@x","name":"O"},"toAssignee":null},
-	 {"createdAt":"` + t0.Add(time.Second).Format(time.RFC3339) + `","actor":{"id":"pm","email":"pm@x","name":"PM"},"toAssignee":{"id":"bot"}}]}}]`}
+	 {"createdAt":"` + t0.Add(time.Second).Format(time.RFC3339) + `","actor":{"id":"pm","email":"pm@x","name":"PM","displayName":"pm-handle"},"toAssignee":{"id":"bot"}}]}}]`}
 	evs, err := New(at(t0), time.Hour).Poll(context.Background(), f.client(t), org1, []string{"ORC"})
 	if err != nil || len(evs) != 1 {
 		t.Fatalf("evs=%v err=%v", evs, err)
 	}
 	ev := evs[0]
-	if ev.Kind != pluginv1.TrackerEvent_ASSIGNED || ev.Actor.Email != "pm@x" || ev.ProjectKey != "ORC" || ev.TicketRef != "ORC-1" {
+	if ev.Kind != pluginv1.TrackerEvent_ASSIGNED || ev.Actor.Email != "pm@x" || ev.Actor.Username != "pm-handle" || ev.ProjectKey != "ORC" || ev.TicketRef != "ORC-1" {
 		t.Fatalf("ev=%v", ev)
 	}
 	if ev.ExternalId != "assign:i1:"+t0.Add(time.Second).Format(time.RFC3339Nano) {

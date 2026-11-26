@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"slices"
+	"strings"
 	"time"
 
 	pluginv1 "github.com/orchivio/orchestrator/contract/gen/orchivio/plugin/v1"
@@ -39,7 +40,7 @@ func New(oauth *linear.OAuth, hub *Hub, interval time.Duration, webhooks bool) *
 }
 
 func (s *Server) GetCapabilities(context.Context, *pluginv1.GetCapabilitiesRequest) (*pluginv1.Capabilities, error) {
-	return &pluginv1.Capabilities{ContractVersion: "plugin.v1", AdapterName: "linear", SupportsWebhooks: s.webhooks}, nil
+	return &pluginv1.Capabilities{ContractVersion: "plugin.v1", AdapterName: "linear", SupportsWebhooks: s.webhooks, SupportsStatusUpdate: true}, nil
 }
 
 func (s *Server) BeginConnect(_ context.Context, req *pluginv1.BeginConnectRequest) (*pluginv1.BeginConnectResponse, error) {
@@ -160,6 +161,18 @@ func (s *Server) PostComment(ctx context.Context, req *pluginv1.PostCommentReque
 	return &pluginv1.PostCommentResponse{CommentId: id}, nil
 }
 
+func (s *Server) SetStatus(ctx context.Context, req *pluginv1.SetStatusRequest) (*pluginv1.SetStatusResponse, error) {
+	cred, err := decode(req.GetCredential())
+	if err != nil {
+		return nil, err
+	}
+	changed, err := s.oauth.Client(cred.AccessToken).SetStatus(ctx, req.GetTicketRef(), req.GetStatus())
+	if err != nil {
+		return nil, grpcError(err)
+	}
+	return &pluginv1.SetStatusResponse{Changed: changed}, nil
+}
+
 // Close ends all open streams so GracefulStop does not wait for them.
 func (s *Server) Close() { s.cancel() }
 
@@ -184,6 +197,8 @@ func grpcError(err error) error {
 	switch {
 	case errors.Is(err, linear.ErrUnauthenticated):
 		return status.Error(codes.Unauthenticated, err.Error())
+	case errors.Is(err, linear.ErrStatusNotFound):
+		return status.Error(codes.FailedPrecondition, strings.TrimPrefix(err.Error(), linear.ErrStatusNotFound.Error()+": "))
 	case errors.Is(err, linear.ErrNotFound):
 		return status.Error(codes.NotFound, err.Error())
 	default:
