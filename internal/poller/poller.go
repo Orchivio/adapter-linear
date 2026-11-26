@@ -173,10 +173,11 @@ func (p *Poller) fetch(ctx context.Context, c *linear.Client, org string, teams 
 			continue
 		}
 		events = append(events, &pluginv1.TrackerEvent{
-			ExternalId:  "comment:" + cm.ID,
-			Kind:        pluginv1.TrackerEvent_COMMENTED,
-			TicketRef:   cm.Issue.Identifier,
-			ProjectKey:  cm.Issue.Team.Key,
+			ExternalId: "comment:" + cm.ID,
+			Kind:       pluginv1.TrackerEvent_COMMENTED,
+			TicketRef:  cm.Issue.Identifier,
+			ProjectKey: cm.Issue.Team.Key,
+			// Username is the Linear handle (displayName) and may be empty; the role identity follows it.
 			Actor:       &pluginv1.Actor{Id: cm.User.ID, Email: cm.User.Email, Name: cm.User.Name, Username: cm.User.DisplayName},
 			Body:        cm.Body,
 			MentionsBot: mentions(cm.Body, viewer),
@@ -213,7 +214,8 @@ func (p *Poller) assignmentEvent(a linear.Assignment, viewer linear.Viewer, sinc
 		Kind:       pluginv1.TrackerEvent_ASSIGNED,
 		TicketRef:  a.Identifier,
 		ProjectKey: a.Team.Key,
-		Actor:      &pluginv1.Actor{Id: best.Actor.ID, Email: best.Actor.Email, Name: best.Actor.Name, Username: best.Actor.DisplayName},
+		// Username is the Linear handle (displayName) and may be empty; the role identity follows it.
+		Actor: &pluginv1.Actor{Id: best.Actor.ID, Email: best.Actor.Email, Name: best.Actor.Name, Username: best.Actor.DisplayName},
 	}
 }
 

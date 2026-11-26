@@ -322,3 +322,16 @@ func TestCapabilitiesSupportStatusUpdate(t *testing.T) {
 		t.Fatalf("caps=%v err=%v", caps, err)
 	}
 }
+
+func TestSetStatusUnauthorizedIsUnauthenticated(t *testing.T) {
+	lin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "expired", http.StatusUnauthorized)
+	}))
+	defer lin.Close()
+	srv := newServer(lin.URL, NewHub(), false, func() time.Time { return issued })
+	defer srv.Close()
+	_, err := srv.SetStatus(context.Background(), &pluginv1.SetStatusRequest{TicketRef: "ORC-1", Status: "Done", Credential: cred("at-1", "org-1")})
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("err = %v", err)
+	}
+}

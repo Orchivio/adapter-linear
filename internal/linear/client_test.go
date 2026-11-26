@@ -136,7 +136,9 @@ func statusServer(t *testing.T, currentState string, mutations *[]map[string]any
 			Query     string         `json:"query"`
 			Variables map[string]any `json:"variables"`
 		}
-		json.NewDecoder(r.Body).Decode(&req)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Error(err)
+		}
 		switch {
 		case strings.Contains(req.Query, "issueUpdate"):
 			*mutations = append(*mutations, req.Variables)
@@ -175,5 +177,36 @@ func TestSetStatusUnknownState(t *testing.T) {
 	_, err := statusServer(t, "Todo", &mutations).SetStatus(context.Background(), "ORC-1", "Shipped")
 	if !errors.Is(err, ErrStatusNotFound) || !strings.Contains(err.Error(), "status Shipped not found for ORC-1") || len(mutations) != 0 {
 		t.Fatalf("err=%v mutations=%v", err, mutations)
+	}
+}
+
+func TestSetStatusMissingIssueIsNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data":{"issue":null}}`))
+	}))
+	defer srv.Close()
+	_, err := New(srv.URL, "k").SetStatus(context.Background(), "ORC-9", "Done")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestSetStatusUnsuccessfulMutationIsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct{ Query string }
+		json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "issueUpdate"):
+			w.Write([]byte(`{"data":{"issueUpdate":{"success":false}}}`))
+		case strings.Contains(req.Query, "workflowStates"):
+			w.Write([]byte(`{"data":{"workflowStates":{"nodes":[{"id":"s1","name":"Done"}],"pageInfo":{"hasNextPage":false}}}}`))
+		default:
+			w.Write([]byte(`{"data":{"issue":{"id":"u","state":{"name":"Todo"},"team":{"id":"t"}}}}`))
+		}
+	}))
+	defer srv.Close()
+	changed, err := New(srv.URL, "k").SetStatus(context.Background(), "ORC-1", "Done")
+	if err == nil || changed || !strings.Contains(err.Error(), "not successful") {
+		t.Fatalf("changed=%v err=%v", changed, err)
 	}
 }
